@@ -5,8 +5,8 @@
 {
 	"$schema": "node_modules/wrangler/config-schema.json",
 	"name": "ai-pr-review",
-	"main": "src/index.js",
-	"compatibility_date": "2026-03-01",
+	"main": "src/worker.js",
+	"compatibility_date": "2026-03-10",
 	"observability": {
 		"enabled": true
 	},
