@@ -1,12 +1,11 @@
-import fetch from "node-fetch";
-
 const ORG = "https://dev.azure.com/bindtuning";
 const AZURE_API_VERSION = "7.0";
 const MAX_DIFF_SIZE = 12000;
+const MAX_FILE_SIZE = 2000;
 const OPENROUTER_MODEL = "stepfun/step-3.5-flash:free";
 
 export default {
-  async fetch(request) {
+  async fetch(request, env, ctx) {
     try {
       if (request.method !== "POST") {
         return new Response("Only POST allowed", { status: 405 });
@@ -30,30 +29,50 @@ export default {
       console.log("(log) Repo ID:", repoId);
       console.log("(log) Project:", project);
 
-      // Fetch PR iterations to get latest
-      const headers = {
-        Authorization: `Basic ${btoa(":" + AZURE_TOKEN)}`,
+      const azureHeaders = {
+        Authorization: `Basic ${btoa(":" + env.AZURE_TOKEN)}`,
       };
 
+      // Fetch PR iterations to get the latest
       const iterUrl = `${ORG}/${project}/_apis/git/repositories/${repoId}/pullRequests/${prId}/iterations?api-version=${AZURE_API_VERSION}`;
-      const iterRes = await fetch(iterUrl, { headers });
+      const iterRes = await fetch(iterUrl, { headers: azureHeaders });
+      if (!iterRes.ok) {
+        const body = await iterRes.text();
+        console.error("(log) Failed to fetch iterations:", iterRes.status, body);
+        return new Response("Failed to fetch iterations", { status: 502 });
+      }
       const iterData = await iterRes.json();
-      const latestIteration = Math.max(...iterData.value.map(i => i.id));
+      const latestIteration = Math.max(...iterData.value.map((i) => i.id));
       console.log("(log) Latest iteration:", latestIteration);
 
       // Fetch changes for this iteration
       const changesUrl = `${ORG}/${project}/_apis/git/repositories/${repoId}/pullRequests/${prId}/iterations/${latestIteration}/changes?api-version=${AZURE_API_VERSION}`;
-      const changesRes = await fetch(changesUrl, { headers });
+      const changesRes = await fetch(changesUrl, { headers: azureHeaders });
+      if (!changesRes.ok) {
+        const body = await changesRes.text();
+        console.error("(log) Failed to fetch changes:", changesRes.status, body);
+        return new Response("Failed to fetch changes", { status: 502 });
+      }
       const changesData = await changesRes.json();
       console.log("(log) Changes response:", JSON.stringify(changesData));
 
       let diff = "";
-      for (const c of changesData.changeEntries || changesData.changes || []) {
+      const entries = changesData.changeEntries || changesData.changes || [];
+      for (const c of entries) {
         const path = c.item?.path;
         const changeType = c.changeType;
 
-        if (!path || path.endsWith("/")) continue; // ignorar pastas
-        if (!["edit", "add"].includes(changeType)) continue;
+        if (!path || path.endsWith("/")) continue; // skip directories
+
+        // Azure DevOps changeType can be numeric (1=add, 2=edit) or string
+        const normalizedType =
+          typeof changeType === "string" ? changeType.toLowerCase() : changeType;
+        const isRelevant =
+          normalizedType === "edit" ||
+          normalizedType === "add" ||
+          normalizedType === 1 ||
+          normalizedType === 2;
+        if (!isRelevant) continue;
 
         console.log("(log) File changed:", path);
 
@@ -61,15 +80,21 @@ export default {
           path
         )}&versionDescriptor.version=${lastCommit}&versionDescriptor.versionType=commit&includeContent=true&api-version=${AZURE_API_VERSION}`;
 
-        const fileRes = await fetch(fileUrl, { headers });
-        if (fileRes.status !== 200) {
-          console.log("(log) Failed to fetch file:", path);
+        const fileRes = await fetch(fileUrl, { headers: azureHeaders });
+        if (!fileRes.ok) {
+          console.log("(log) Failed to fetch file:", path, fileRes.status);
           continue;
         }
 
         const content = await fileRes.text();
-        diff += `\nFILE: ${path}\n`;
-        diff += content.substring(0, 2000); // limite por ficheiro
+        const fileChunk = `\nFILE: ${path}\n${content.substring(0, MAX_FILE_SIZE)}`;
+
+        // Respect overall diff size limit
+        if (diff.length + fileChunk.length > MAX_DIFF_SIZE) {
+          console.log("(log) Diff size limit reached, skipping remaining files");
+          break;
+        }
+        diff += fileChunk;
       }
 
       if (!diff) {
@@ -79,13 +104,18 @@ export default {
 
       console.log("(log) Diff size:", diff.length);
 
-      // Chamada à OpenRouter
-      const prompt = `You are a senior software engineer. Review the following code changes.\nFormat: [file]:[line] - description\n\nDiff:\n${diff}`;
+      // Call OpenRouter LLM for code review
+      const prompt = `You are a senior software engineer. Review the following code changes from a pull request.
+Provide actionable feedback grouped by file.
+Format each comment as: [file]:[line] - description
+
+Diff:
+${diff}`;
 
       const llmRes = await fetch("https://openrouter.ai/api/v1/chat/completions", {
         method: "POST",
         headers: {
-          Authorization: `Bearer ${OPENROUTER_KEY}`,
+          Authorization: `Bearer ${env.OPENROUTER_KEY}`,
           "Content-Type": "application/json",
         },
         body: JSON.stringify({
@@ -94,19 +124,53 @@ export default {
         }),
       });
 
+      if (!llmRes.ok) {
+        const body = await llmRes.text();
+        console.error("(log) LLM request failed:", llmRes.status, body);
+        return new Response("LLM request failed", { status: 502 });
+      }
+
       const llmData = await llmRes.json();
-      const reviewText = llmData.choices?.[0]?.message?.content || "Error: No review returned";
+      const reviewText =
+        llmData.choices?.[0]?.message?.content || "No review content returned.";
 
       console.log("(log) LLM review:", reviewText);
 
-      // TODO: Post review back to Azure PR as comment (requires Azure DevOps PR threads API)
-      // Para já só log
-      console.log("(log) Review completed");
+      // Post the review back to Azure DevOps as a PR comment thread
+      const threadUrl = `${ORG}/${project}/_apis/git/repositories/${repoId}/pullRequests/${prId}/threads?api-version=${AZURE_API_VERSION}`;
+      const threadBody = {
+        comments: [
+          {
+            parentCommentId: 0,
+            content: `## 🤖 AI Code Review\n\n${reviewText}`,
+            commentType: 1, // 1 = text
+          },
+        ],
+        status: 4, // 4 = closed (informational, not blocking)
+      };
 
-      return new Response("Webhook processed", { status: 200 });
+      const threadRes = await fetch(threadUrl, {
+        method: "POST",
+        headers: {
+          ...azureHeaders,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(threadBody),
+      });
+
+      if (!threadRes.ok) {
+        const body = await threadRes.text();
+        console.error("(log) Failed to post PR comment:", threadRes.status, body);
+        return new Response("Review generated but failed to post comment", {
+          status: 502,
+        });
+      }
+
+      console.log("(log) Review posted to PR successfully");
+      return new Response("Review posted", { status: 200 });
     } catch (err) {
-      console.error("(log) Error:", err);
-      return new Response(err.message || "Error", { status: 500 });
+      console.error("(log) Error:", err.stack || err);
+      return new Response(err.message || "Internal error", { status: 500 });
     }
   },
 };
