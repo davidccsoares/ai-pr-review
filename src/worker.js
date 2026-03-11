@@ -42,124 +42,80 @@ async function fetchFileAtCommit(project, repoId, path, commitId, headers) {
 }
 
 /**
- * Compute hunks between old and new file, outputting ONLY changed regions
- * with CONTEXT_LINES of surrounding context. Line numbers refer to the NEW file.
+ * Simple and exact diff: compare old and new files line by line.
+ * For each line in the new file, check if it differs from the old file at
+ * the same position. Group consecutive changed lines into hunks with context.
  *
- * Output format (each hunk separated by "---"):
- *   @@ lines NEW_START-NEW_END @@
- *    42: unchanged context line
- *   -43: removed line (old file)
- *   +43: added line (new file)
- *    44: unchanged context line
+ * This is NOT an LCS diff — it's a positional comparison. It works perfectly
+ * when lines are edited in-place (same line count or close), which is the
+ * common case for small PRs. For added/removed lines, it detects the shift.
  */
-function computeHunks(oldText, newText) {
+function computeDiff(oldText, newText) {
   const oldLines = (oldText || "").split("\n");
   const newLines = (newText || "").split("\n");
+  const maxLen = Math.max(oldLines.length, newLines.length);
 
-  // 1. Find all change positions using LCS-style scan
-  const changes = []; // { oldStart, oldEnd, newStart, newEnd }
-  let i = 0;
-  let j = 0;
-
-  while (i < oldLines.length && j < newLines.length) {
-    if (oldLines[i] === newLines[j]) {
-      i++;
-      j++;
-      continue;
-    }
-    // Start of a change block
-    const oldStart = i;
-    const newStart = j;
-
-    // Scan forward to find where lines match again
-    let found = false;
-    for (let radius = 1; radius < 50 && !found; radius++) {
-      // Check if skipping `radius` old lines re-syncs
-      if (i + radius < oldLines.length && oldLines[i + radius] === newLines[j]) {
-        changes.push({ oldStart, oldEnd: i + radius, newStart, newEnd: j });
-        i = i + radius;
-        found = true;
-      }
-      // Check if skipping `radius` new lines re-syncs
-      if (!found && j + radius < newLines.length && oldLines[i] === newLines[j + radius]) {
-        changes.push({ oldStart, oldEnd: i, newStart, newEnd: j + radius });
-        j = j + radius;
-        found = true;
-      }
-      // Check diagonal skip
-      if (!found && i + radius < oldLines.length && j + radius < newLines.length && oldLines[i + radius] === newLines[j + radius]) {
-        changes.push({ oldStart, oldEnd: i + radius, newStart, newEnd: j + radius });
-        i = i + radius;
-        j = j + radius;
-        found = true;
-      }
-    }
-
-    if (!found) {
-      // Can't re-sync within radius, treat rest as one big change
-      changes.push({ oldStart, oldEnd: oldLines.length, newStart, newEnd: newLines.length });
-      i = oldLines.length;
-      j = newLines.length;
+  // 1. Find which lines in the new file are different
+  const diffPositions = []; // indices (0-based) in new file that differ
+  for (let i = 0; i < maxLen; i++) {
+    const oldLine = i < oldLines.length ? oldLines[i] : undefined;
+    const newLine = i < newLines.length ? newLines[i] : undefined;
+    if (oldLine !== newLine) {
+      diffPositions.push(i);
     }
   }
 
-  // Handle trailing lines
-  if (i < oldLines.length || j < newLines.length) {
-    changes.push({ oldStart: i, oldEnd: oldLines.length, newStart: j, newEnd: newLines.length });
-  }
+  if (diffPositions.length === 0) return { diff: "", changedLines: [] };
 
-  if (changes.length === 0) return { hunks: "", changedLines: [] };
+  // 2. Group into hunks (consecutive changes merged with context gap)
+  const hunks = []; // each: { start, end } (0-based indices in new file)
+  let hunkStart = diffPositions[0];
+  let hunkEnd = diffPositions[0];
 
-  // 2. Merge nearby changes into hunks (merge if gap <= CONTEXT_LINES * 2)
-  const merged = [changes[0]];
-  for (let k = 1; k < changes.length; k++) {
-    const prev = merged[merged.length - 1];
-    const curr = changes[k];
-    if (curr.newStart - prev.newEnd <= CONTEXT_LINES * 2) {
-      prev.oldEnd = curr.oldEnd;
-      prev.newEnd = curr.newEnd;
+  for (let k = 1; k < diffPositions.length; k++) {
+    if (diffPositions[k] - hunkEnd <= CONTEXT_LINES * 2 + 1) {
+      hunkEnd = diffPositions[k];
     } else {
-      merged.push({ ...curr });
+      hunks.push({ start: hunkStart, end: hunkEnd });
+      hunkStart = diffPositions[k];
+      hunkEnd = diffPositions[k];
     }
   }
+  hunks.push({ start: hunkStart, end: hunkEnd });
 
-  // 3. Format hunks
+  // 3. Format each hunk with context
   const output = [];
-  const changedLines = []; // All line numbers visible in the diff (changed + context)
+  const changedLines = [];
 
-  for (const hunk of merged) {
-    const ctxBefore = Math.max(0, hunk.newStart - CONTEXT_LINES);
-    const ctxAfter = Math.min(newLines.length, hunk.newEnd + CONTEXT_LINES);
+  for (const hunk of hunks) {
+    const ctxStart = Math.max(0, hunk.start - CONTEXT_LINES);
+    const ctxEnd = Math.min(newLines.length - 1, hunk.end + CONTEXT_LINES);
 
-    output.push(`@@ lines ${ctxBefore + 1}-${ctxAfter} @@`);
+    output.push(`@@ line ${ctxStart + 1} @@`);
 
-    // Context before
-    for (let c = ctxBefore; c < hunk.newStart; c++) {
-      output.push(` ${c + 1}: ${newLines[c]}`);
-      changedLines.push(c + 1);
+    for (let i = ctxStart; i <= ctxEnd; i++) {
+      const isChanged = diffPositions.includes(i);
+      const lineNum = i + 1; // 1-based
+      const newLine = i < newLines.length ? newLines[i] : "";
+      const oldLine = i < oldLines.length ? oldLines[i] : "";
+
+      if (isChanged) {
+        if (oldLine !== undefined && i < oldLines.length) {
+          output.push(`-${lineNum}: ${oldLine}`);
+        }
+        if (i < newLines.length) {
+          output.push(`+${lineNum}: ${newLine}`);
+          changedLines.push(lineNum);
+        }
+      } else {
+        output.push(` ${lineNum}: ${newLine}`);
+        changedLines.push(lineNum);
+      }
     }
-
-    // Removed lines (from old file)
-    for (let r = hunk.oldStart; r < hunk.oldEnd; r++) {
-      output.push(`-    : ${oldLines[r]}`);
-    }
-
-    // Added lines (from new file) — these have the real line numbers
-    for (let a = hunk.newStart; a < hunk.newEnd; a++) {
-      output.push(`+${a + 1}: ${newLines[a]}`);
-      changedLines.push(a + 1);
-    }
-
-    // Context after
-    for (let c = hunk.newEnd; c < ctxAfter; c++) {
-      output.push(` ${c + 1}: ${newLines[c]}`);
-      changedLines.push(c + 1);
-    }
-
     output.push("---");
   }
 
-  return { hunks: output.join("\n"), changedLines };
+  return { diff: output.join("\n"), changedLines };
 }
 
 // ─── Main Review Logic ──────────────────────────────────────────────────────
@@ -200,7 +156,7 @@ async function processReview(payload, env) {
     const changesData = await changesRes.json();
     const entries = changesData.changeEntries || changesData.changes || [];
 
-    // 3. For each changed file, compute hunks (only changed lines + context)
+    // 3. For each changed file, compute diff
     const fileChanges = [];
 
     for (const c of entries) {
@@ -229,18 +185,17 @@ async function processReview(payload, env) {
 
       let diff, changedLines;
       if (isEdit) {
-        const result = computeHunks(oldContent, newContent);
-        diff = result.hunks;
+        const result = computeDiff(oldContent, newContent);
+        diff = result.diff;
         changedLines = result.changedLines;
       } else {
-        // For new files, show first N lines
         const lines = newContent.split("\n").slice(0, 80);
         diff = lines.map((l, idx) => `+${idx + 1}: ${l}`).join("\n");
         changedLines = lines.map((_, idx) => idx + 1);
       }
 
       if (diff) {
-        console.log(`(log) ${path}: ${changedLines.length} lines in diff [${changedLines.slice(0, 10).join(",")}...]`);
+        console.log(`(log) ${path}: changed lines [${changedLines.slice(0, 15).join(",")}...]`);
         fileChanges.push({
           path,
           changeTrackingId,
@@ -256,7 +211,7 @@ async function processReview(payload, env) {
       return;
     }
 
-    // 4. Build prompt with only the changed hunks
+    // 4. Build prompt with the diff hunks
     let diffBlock = "";
     for (const fc of fileChanges) {
       const header = `\n### FILE: ${fc.path} (${fc.isAdd ? "new file" : "edited"})`;
@@ -272,19 +227,22 @@ async function processReview(payload, env) {
     console.log(`(log) Files to review: ${fileList}`);
     console.log(`(log) Diff size for AI: ${diffBlock.length} chars`);
 
-    const systemPrompt = `You are a senior code reviewer. Review the PR diff and return a JSON array.
+    const systemPrompt = `You are a senior code reviewer. Review ONLY the changed lines in the PR diff below.
 
 OUTPUT FORMAT — respond with ONLY a raw JSON array, no markdown, no code fences:
 [{"file":"/path/to/file.cs","line":42,"comment":"Your feedback"}]
 
 RULES:
-1. "file" must exactly match the file path from the diff header
-2. "line" must be a line number shown in the diff (from + or context lines)
-3. Keep each comment concise (1-2 sentences)
-4. Focus on: bugs, null risks, security, performance, logic errors
-5. Skip trivial style issues — do NOT comment on things that are fine
-6. Only flag real issues. If code is clean, return: [{"file":"/path","line":1,"comment":"LGTM"}]
-7. Max 3 comments per file`;
+1. ONLY comment on lines prefixed with "+" (these are the changed/added lines)
+2. NEVER comment on context lines (prefixed with a space) or removed lines (prefixed with "-")
+3. "file" must exactly match the file path from the diff header
+4. "line" must be the exact line number shown after the "+" prefix
+5. NEVER repeat the same line number — one comment per line, max
+6. Keep each comment concise (1-2 sentences)
+7. Focus on: actual bugs, null reference risks, security vulnerabilities, clear logic errors
+8. Do NOT guess or speculate — only flag issues you are certain about
+9. Do NOT comment on code style, naming, or formatting
+10. If the changed code looks correct, return: [{"file":"/path","line":1,"comment":"LGTM"}]`;
 
     const userPrompt = `PR: "${prTitle}"
 Files changed: ${fileList}
@@ -308,7 +266,7 @@ ${diffBlock}`;
       : JSON.stringify(rawResponse, null, 2);
     console.log("(log) AI response:", rawReview);
 
-    // 6. Parse response — handle both already-parsed and string responses
+    // 6. Parse response
     let comments;
     try {
       if (Array.isArray(rawResponse)) {
@@ -320,6 +278,16 @@ ${diffBlock}`;
         comments = [];
       }
       if (!Array.isArray(comments)) comments = [];
+      // Deduplicate: keep only the first comment per file+line
+      if (comments.length > 0) {
+        const seen = new Set();
+        comments = comments.filter((c) => {
+          const key = `${c.file}:${c.line}`;
+          if (seen.has(key)) return false;
+          seen.add(key);
+          return true;
+        });
+      }
     } catch (e) {
       console.error("(log) JSON parse failed:", e.message);
       comments = null;
@@ -327,11 +295,10 @@ ${diffBlock}`;
 
     const threadBaseUrl = `${ORG}/${project}/_apis/git/repositories/${repoId}/pullRequests/${prId}/threads?api-version=${AZURE_API_VERSION}`;
 
-    // 7. Build a single PR-level summary comment with all findings
+    // 7. Build a single PR-level summary comment
     const summary = [`## 🤖 AI Code Review`, ``, `**PR:** ${prTitle}  `, `**Files reviewed:** ${fileChanges.length}`, ``];
 
     if (comments && comments.length > 0) {
-      // Group comments by file
       const byFile = {};
       for (const c of comments) {
         if (!c.file || !c.comment) continue;
@@ -363,13 +330,12 @@ ${diffBlock}`;
         summary.push(`---`, `✅ **All changes look good!**`);
       }
     } else if (comments === null) {
-      // AI response couldn't be parsed — include raw text
       summary.push(`### Review`, ``, rawReview || "No review content returned.");
     } else {
       summary.push(`✅ **No issues found.** Code looks good!`);
     }
 
-    // 8. Post the single summary comment
+    // 8. Post the summary
     const summaryBody = {
       comments: [
         {
