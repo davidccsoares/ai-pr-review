@@ -327,10 +327,11 @@ ${diffBlock}`;
 
     const threadBaseUrl = `${ORG}/${project}/_apis/git/repositories/${repoId}/pullRequests/${prId}/threads?api-version=${AZURE_API_VERSION}`;
 
-    // 7. Group comments by file and post ONE consolidated inline thread per file
-    let posted = 0;
+    // 7. Build a single PR-level summary comment with all findings
+    const summary = [`## 🤖 AI Code Review`, ``, `**PR:** ${prTitle}  `, `**Files reviewed:** ${fileChanges.length}`, ``];
+
     if (comments && comments.length > 0) {
-      // Group by file path
+      // Group comments by file
       const byFile = {};
       for (const c of comments) {
         if (!c.file || !c.comment) continue;
@@ -338,105 +339,42 @@ ${diffBlock}`;
         byFile[c.file].push(c);
       }
 
-      for (const [filePath, fileComments] of Object.entries(byFile)) {
-        const fileChange = fileChanges.find((fc) => fc.path === filePath);
-        const isLgtm = fileComments.every((c) => c.comment?.toLowerCase().includes("lgtm"));
+      let hasIssues = false;
+      for (const fc of fileChanges) {
+        const fileComments = byFile[fc.path] || [];
+        const fileName = fc.path.split("/").pop();
+        const isLgtm = fileComments.length > 0 && fileComments.every((c) => c.comment?.toLowerCase().includes("lgtm"));
 
-        // Skip posting if every comment is just LGTM — it'll show in the summary
-        if (isLgtm) continue;
-
-        // Pick the first changed line as the anchor for the thread
-        let anchorLine = parseInt(fileComments[0].line, 10) || 1;
-        if (fileChange && !fileChange.changedLines.includes(anchorLine)) {
-          anchorLine = fileChange.changedLines[0] || 1;
-        }
-
-        // Build consolidated comment body
-        const fileName = filePath.split("/").pop();
-        let body = `🤖 **AI Review — \`${fileName}\`**\n\n`;
-        for (const c of fileComments) {
-          const line = parseInt(c.line, 10);
-          if (c.comment.toLowerCase().includes("lgtm")) continue;
-          body += `- **Line ${line}:** ${c.comment}\n`;
-        }
-
-        const threadBody = {
-          comments: [
-            {
-              parentCommentId: 0,
-              content: body.trim(),
-              commentType: 1,
-            },
-          ],
-          status: 4,
-          threadContext: {
-            filePath,
-            rightFileStart: { line: anchorLine, offset: 1 },
-            rightFileEnd: { line: anchorLine, offset: 1 },
-          },
-        };
-
-        if (fileChange?.changeTrackingId) {
-          threadBody.pullRequestThreadContext = {
-            changeTrackingId: fileChange.changeTrackingId,
-            iterationContext: {
-              firstComparingIteration: 1,
-              secondComparingIteration: latestIteration,
-            },
-          };
-        }
-
-        const threadRes = await fetch(threadBaseUrl, {
-          method: "POST",
-          headers: { ...azureHeaders, "Content-Type": "application/json" },
-          body: JSON.stringify(threadBody),
-        });
-
-        if (threadRes.ok) {
-          posted++;
-          console.log(`(log) ✓ Consolidated comment on ${filePath} (${fileComments.length} items)`);
+        if (fileComments.length === 0 || isLgtm) {
+          summary.push(`### ✅ \`${fileName}\``, `No issues found.`, ``);
         } else {
-          const errBody = await threadRes.text();
-          console.error(`(log) ✗ Failed ${filePath} (${threadRes.status}): ${errBody}`);
+          hasIssues = true;
+          summary.push(`### 📝 \`${fileName}\``);
+          for (const c of fileComments) {
+            if (c.comment?.toLowerCase().includes("lgtm")) continue;
+            const line = parseInt(c.line, 10);
+            summary.push(`- **Line ${line}:** ${c.comment}`);
+          }
+          summary.push(``);
         }
       }
-    }
 
-    // 8. Post PR-level summary
-    const summaryLines = [
-      `## 🤖 AI Code Review Summary`,
-      ``,
-      `**PR:** ${prTitle}`,
-      `**Files reviewed:** ${fileChanges.length}`,
-      ``,
-      `| File | Status |`,
-      `|------|--------|`,
-    ];
-
-    for (const fc of fileChanges) {
-      const relevant = (comments || []).filter((c) => c.file === fc.path);
-      const status = relevant.length === 0
-        ? "✅ No issues"
-        : relevant.every((c) => c.comment?.includes("LGTM"))
-          ? "✅ Looks good"
-          : `💬 ${relevant.length} comment(s)`;
-      summaryLines.push(`| \`${fc.path.split("/").pop()}\` | ${status} |`);
-    }
-
-    if (posted > 0) {
-      summaryLines.push("", `📝 **${posted} file review(s)** posted as inline comments.`);
+      if (!hasIssues) {
+        summary.push(`---`, `✅ **All changes look good!**`);
+      }
     } else if (comments === null) {
-      // AI response couldn't be parsed — include it in the summary
-      summaryLines.push("", "### Review", "", rawReview || "No review content returned.");
+      // AI response couldn't be parsed — include raw text
+      summary.push(`### Review`, ``, rawReview || "No review content returned.");
     } else {
-      summaryLines.push("", "✅ **No issues found.** Code looks good!");
+      summary.push(`✅ **No issues found.** Code looks good!`);
     }
 
+    // 8. Post the single summary comment
     const summaryBody = {
       comments: [
         {
           parentCommentId: 0,
-          content: summaryLines.join("\n"),
+          content: summary.join("\n"),
           commentType: 1,
         },
       ],
@@ -450,12 +388,12 @@ ${diffBlock}`;
     });
 
     if (summaryRes.ok) {
-      console.log("(log) ✓ Summary posted");
+      console.log("(log) ✓ Review posted");
     } else {
-      console.error("(log) ✗ Summary failed:", summaryRes.status);
+      console.error("(log) ✗ Post failed:", summaryRes.status, await summaryRes.text());
     }
 
-    console.log(`(log) Done! PR ${prId}: ${posted} inline + 1 summary`);
+    console.log(`(log) Done! PR ${prId}`);
   } catch (err) {
     console.error("(log) Error:", err.stack || err);
   }
