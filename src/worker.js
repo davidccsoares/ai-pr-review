@@ -90,52 +90,58 @@ export default {
 
 async function getAzureDiff(org, project, repoId, prId, headers) {
 
-  // obter iterations do PR
-  const iterUrl =
+  // obter commits da PR
+  const commitsUrl =
     `${org}/${project}/_apis/git/repositories/${repoId}` +
-    `/pullRequests/${prId}/iterations?api-version=7.0`;
+    `/pullRequests/${prId}/commits?api-version=7.0`;
 
-  const iterRes = await fetch(iterUrl, { headers });
-  const iterData = await iterRes.json();
+  const commitsRes = await fetch(commitsUrl, { headers });
+  const commits = await commitsRes.json();
 
-  const latest = iterData.value[iterData.value.length - 1];
-  const iterationId = latest.id;
+  const lastCommit = commits.value[commits.value.length - 1].commitId;
 
-  console.log("Iteration:", iterationId);
+  console.log("Last commit:", lastCommit);
 
+  // obter changes desse commit
   const changesUrl =
     `${org}/${project}/_apis/git/repositories/${repoId}` +
-    `/pullRequests/${prId}/iterations/${iterationId}/changes?api-version=7.0`;
+    `/commits/${lastCommit}/changes?api-version=7.0`;
 
   const changesRes = await fetch(changesUrl, { headers });
   const changes = await changesRes.json();
 
   let diff = "";
 
-  for (const c of changes.changeEntries || []) {
+  for (const c of changes.changes || []) {
 
     const path = c.item?.path;
     if (!path) continue;
 
-    console.log("File changed:", path);
+    console.log("Changed file:", path);
 
-    if (c.item?.contentMetadata?.encoding === 1200)
+    const fileUrl =
+      `${org}/${project}/_apis/git/repositories/${repoId}/items` +
+      `?path=${encodeURIComponent(path)}` +
+      `&versionDescriptor.version=${lastCommit}` +
+      `&versionDescriptor.versionType=commit` +
+      `&includeContent=true` +
+      `&api-version=7.0`;
+
+    const res = await fetch(fileUrl, { headers });
+
+    if (res.status !== 200)
       continue;
 
-    const changeType = c.changeType;
+    const content = await res.text();
 
     diff += `\nFILE: ${path}\n`;
-    diff += `CHANGE: ${changeType}\n`;
+    diff += content.substring(0, 2000);
 
-    if (c.diff) {
-      diff += c.diff;
-    }
+    if (diff.length > MAX_PATCH)
+      break;
   }
 
   console.log("Diff size:", diff.length);
-
-  if (diff.length > MAX_PATCH)
-    diff = diff.substring(0, MAX_PATCH);
 
   return diff;
 }
