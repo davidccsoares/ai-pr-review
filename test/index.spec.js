@@ -25,6 +25,42 @@ describe('AI PR Review worker', () => {
 		expect(await response.text()).toBe('No PR');
 	});
 
+	it('returns 400 for invalid JSON body', async () => {
+		const request = new Request('http://example.com', {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: 'not json',
+		});
+		const ctx = createExecutionContext();
+		const response = await worker.fetch(request, env, ctx);
+		await waitOnExecutionContext(ctx);
+		expect(response.status).toBe(400);
+	});
+
+	it('returns 202 for valid PR webhook payload', async () => {
+		const request = new Request('http://example.com', {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({
+				resource: {
+					pullRequestId: 123,
+					repository: {
+						id: 'repo-id',
+						project: { name: 'MyProject' },
+					},
+					lastMergeSourceCommit: { commitId: 'abc123' },
+					lastMergeTargetCommit: { commitId: 'def456' },
+				},
+			}),
+		});
+		const ctx = createExecutionContext();
+		const response = await worker.fetch(request, env, ctx);
+		// Don't waitOnExecutionContext here — the background work will fail
+		// (no real Azure/OpenRouter), but the immediate response should be 202.
+		expect(response.status).toBe(202);
+		expect(await response.text()).toBe('Accepted');
+	});
+
 	it('rejects non-POST requests (integration style)', async () => {
 		const response = await SELF.fetch('http://example.com');
 		expect(response.status).toBe(405);
