@@ -90,56 +90,52 @@ export default {
 
 async function getAzureDiff(org, project, repoId, prId, headers) {
 
-  // obter commits do PR
-  const prUrl =
+  // obter iterations do PR
+  const iterUrl =
     `${org}/${project}/_apis/git/repositories/${repoId}` +
-    `/pullRequests/${prId}?api-version=7.0`;
+    `/pullRequests/${prId}/iterations?api-version=7.0`;
 
-  const prRes = await fetch(prUrl, { headers });
-  const pr = await prRes.json();
+  const iterRes = await fetch(iterUrl, { headers });
+  const iterData = await iterRes.json();
 
-  const commitId = pr.lastMergeSourceCommit.commitId;
+  const latest = iterData.value[iterData.value.length - 1];
+  const iterationId = latest.id;
 
-  console.log("Commit:", commitId);
+  console.log("Iteration:", iterationId);
 
   const changesUrl =
     `${org}/${project}/_apis/git/repositories/${repoId}` +
-    `/commits/${commitId}/changes?api-version=7.0`;
+    `/pullRequests/${prId}/iterations/${iterationId}/changes?api-version=7.0`;
 
   const changesRes = await fetch(changesUrl, { headers });
   const changes = await changesRes.json();
 
   let diff = "";
 
-  for (const c of changes.changes || []) {
+  for (const c of changes.changeEntries || []) {
 
     const path = c.item?.path;
-
     if (!path) continue;
 
-    console.log("Fetching file:", path);
+    console.log("File changed:", path);
 
-    const fileUrl =
-      `${org}/${project}/_apis/git/repositories/${repoId}/items` +
-      `?path=${encodeURIComponent(path)}` +
-      `&versionDescriptor.version=${commitId}` +
-      `&versionDescriptor.versionType=commit` +
-      `&includeContent=true` +
-      `&api-version=7.0`;
-
-    const fileRes = await fetch(fileUrl, { headers });
-
-    if (fileRes.status !== 200)
+    if (c.item?.contentMetadata?.encoding === 1200)
       continue;
 
-    const content = await fileRes.text();
+    const changeType = c.changeType;
 
     diff += `\nFILE: ${path}\n`;
-    diff += content.substring(0, 8000);
+    diff += `CHANGE: ${changeType}\n`;
 
-    if (diff.length > MAX_PATCH)
-      break;
+    if (c.diff) {
+      diff += c.diff;
+    }
   }
+
+  console.log("Diff size:", diff.length);
+
+  if (diff.length > MAX_PATCH)
+    diff = diff.substring(0, MAX_PATCH);
 
   return diff;
 }
