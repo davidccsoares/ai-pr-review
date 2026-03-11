@@ -90,29 +90,58 @@ export default {
 
 async function getAzureDiff(org, project, repoId, prId, headers) {
 
-  const url =
+  // obter commits do PR
+  const prUrl =
     `${org}/${project}/_apis/git/repositories/${repoId}` +
-    `/pullRequests/${prId}/iterations/1/changes?api-version=7.0`;
+    `/pullRequests/${prId}?api-version=7.0`;
 
-  const r = await fetch(url, { headers });
+  const prRes = await fetch(prUrl, { headers });
+  const pr = await prRes.json();
 
-  const json = await r.json();
+  const commitId = pr.lastMergeSourceCommit.commitId;
 
-  const changes = json.changeEntries || [];
+  console.log("Commit:", commitId);
 
-  let patch = "";
+  const changesUrl =
+    `${org}/${project}/_apis/git/repositories/${repoId}` +
+    `/commits/${commitId}/changes?api-version=7.0`;
 
-  for (const c of changes) {
+  const changesRes = await fetch(changesUrl, { headers });
+  const changes = await changesRes.json();
 
-    if (!c.item?.path) continue;
+  let diff = "";
 
-    patch += `\nFILE: ${c.item.path}\n`;
+  for (const c of changes.changes || []) {
+
+    const path = c.item?.path;
+
+    if (!path) continue;
+
+    console.log("Fetching file:", path);
+
+    const fileUrl =
+      `${org}/${project}/_apis/git/repositories/${repoId}/items` +
+      `?path=${encodeURIComponent(path)}` +
+      `&versionDescriptor.version=${commitId}` +
+      `&versionDescriptor.versionType=commit` +
+      `&includeContent=true` +
+      `&api-version=7.0`;
+
+    const fileRes = await fetch(fileUrl, { headers });
+
+    if (fileRes.status !== 200)
+      continue;
+
+    const content = await fileRes.text();
+
+    diff += `\nFILE: ${path}\n`;
+    diff += content.substring(0, 8000);
+
+    if (diff.length > MAX_PATCH)
+      break;
   }
 
-  if (patch.length > MAX_PATCH)
-    patch = patch.substring(0, MAX_PATCH);
-
-  return patch;
+  return diff;
 }
 
 
