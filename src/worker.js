@@ -2,7 +2,7 @@ const ORG = "https://dev.azure.com/bindtuning";
 const AZURE_API_VERSION = "7.0";
 const MAX_DIFF_SIZE = 12000;
 const MAX_FILE_SIZE = 3000;
-const OPENROUTER_MODEL = "stepfun/step-3.5-flash:free";
+const CF_AI_MODEL = "@cf/qwen/qwen2.5-coder-32b-instruct";
 
 export default {
   async fetch(request, env, ctx) {
@@ -55,11 +55,10 @@ function computeSimpleDiff(oldText, newText) {
   const newLines = (newText || "").split("\n");
 
   const result = [];
-  const contextLines = 2;
+  const contextLines = 3;
   let i = 0;
   let j = 0;
 
-  // Simple line-by-line comparison; good enough for small diffs
   while (i < oldLines.length || j < newLines.length) {
     if (i < oldLines.length && j < newLines.length && oldLines[i] === newLines[j]) {
       i++;
@@ -73,16 +72,13 @@ function computeSimpleDiff(oldText, newText) {
       result.push(`  ${c + 1}: ${newLines[c]}`);
     }
 
-    // Show removed and added lines
+    // Find the end of the differing block
     let oldEnd = i;
     let newEnd = j;
-
-    // Find the end of the differing block
     while (oldEnd < oldLines.length && newEnd < newLines.length && oldLines[oldEnd] !== newLines[newEnd]) {
       oldEnd++;
       newEnd++;
     }
-    // Handle case where one file is longer
     if (oldEnd >= oldLines.length || newEnd >= newLines.length) {
       while (oldEnd < oldLines.length) oldEnd++;
       while (newEnd < newLines.length) newEnd++;
@@ -117,8 +113,7 @@ async function processReview(payload, env) {
     const targetCommit = payload.resource.lastMergeTargetCommit.commitId;
 
     console.log(`(log) Processing PR ${prId} | Project: ${project}`);
-    console.log(`(log) Source commit: ${sourceCommit}`);
-    console.log(`(log) Target commit: ${targetCommit}`);
+    console.log(`(log) Source: ${sourceCommit} | Target: ${targetCommit}`);
 
     const azureHeaders = {
       Authorization: `Basic ${btoa(":" + env.AZURE_TOKEN)}`,
@@ -135,7 +130,7 @@ async function processReview(payload, env) {
     const latestIteration = Math.max(...iterData.value.map((i) => i.id));
     console.log("(log) Latest iteration:", latestIteration);
 
-    // 2. Fetch changes for this iteration to know which files changed
+    // 2. Fetch changes for this iteration
     const changesUrl = `${ORG}/${project}/_apis/git/repositories/${repoId}/pullRequests/${prId}/iterations/${latestIteration}/changes?api-version=${AZURE_API_VERSION}`;
     const changesRes = await fetch(changesUrl, { headers: azureHeaders });
     if (!changesRes.ok) {
@@ -162,7 +157,7 @@ async function processReview(payload, env) {
 
       console.log(`(log) File changed (${changeType}): ${path}`);
 
-      // 3. Fetch both old (target branch) and new (source commit) versions
+      // 3. Fetch both old and new versions of the file
       const [oldContent, newContent] = await Promise.all([
         isEdit ? fetchFileAtCommit(project, repoId, path, targetCommit, azureHeaders) : Promise.resolve(null),
         fetchFileAtCommit(project, repoId, path, sourceCommit, azureHeaders),
@@ -202,61 +197,39 @@ async function processReview(payload, env) {
 
     console.log("(log) Total diff size for LLM:", diffBlock.length);
 
-    const prompt = `You are a senior software engineer reviewing a pull request.
-Analyze the following code changes and provide review comments.
+    const systemPrompt = `You are a senior software engineer reviewing a pull request.
+Analyze code changes and return review comments as a JSON array.
 
-IMPORTANT: Respond ONLY with a valid JSON array. No markdown, no explanation outside the JSON.
-Each element must be an object with these fields:
-- "file": the file path exactly as shown (e.g. "/BindTuning/Models/Admins/Purchase.cs")
-- "line": the line number in the NEW version of the file where your comment applies (integer)
-- "comment": your review comment for that line/section
+RULES:
+- Respond ONLY with a valid JSON array. No markdown fences, no explanation outside the JSON.
+- Each element: {"file": "<path>", "line": <int>, "comment": "<text>"}
+- "file" must match the file path exactly as shown
+- "line" is the line number in the NEW version (from "+" prefixed lines)
+- Focus on: bugs, logic errors, null references, security, performance, best practices
+- If the code looks good, return: [{"file":"<path>","line":1,"comment":"LGTM - code looks good."}]`;
 
-Lines prefixed with "+" are ADDED lines (with their line number in the new file).
-Lines prefixed with "-" are REMOVED lines.
-Lines prefixed with " " (space) are context (unchanged) lines.
-
-Focus on:
-- Bugs, logic errors, potential null references
-- Security issues
-- Performance concerns
-- Code style and best practices
-
-If the code looks good, return a single-element array with a general positive comment (set line to 1).
-
-Changes:
+    const userPrompt = `Review these changes:
 ${diffBlock}`;
 
-    // 5. Call OpenRouter LLM
-    const llmRes = await fetch("https://openrouter.ai/api/v1/chat/completions", {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${env.OPENROUTER_KEY}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        model: OPENROUTER_MODEL,
-        messages: [{ role: "user", content: prompt }],
-      }),
+    // 5. Call Cloudflare Workers AI (runs on the edge, no external HTTP call)
+    console.log("(log) Calling Workers AI model:", CF_AI_MODEL);
+    const aiResponse = await env.AI.run(CF_AI_MODEL, {
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userPrompt },
+      ],
     });
 
-    if (!llmRes.ok) {
-      console.error("(log) LLM request failed:", llmRes.status, await llmRes.text());
-      return;
-    }
+    const rawReview = aiResponse?.response || "";
+    console.log("(log) AI response:", rawReview);
 
-    const llmData = await llmRes.json();
-    const rawReview = llmData.choices?.[0]?.message?.content || "";
-    console.log("(log) Raw LLM response:", rawReview);
-
-    // 6. Parse LLM response into structured comments
+    // 6. Parse AI response into structured comments
     let comments;
     try {
-      // Extract JSON array from the response (handle markdown code fences)
       const jsonMatch = rawReview.match(/\[[\s\S]*\]/);
       comments = jsonMatch ? JSON.parse(jsonMatch[0]) : [];
     } catch (e) {
-      console.error("(log) Failed to parse LLM JSON, falling back to single comment:", e.message);
-      // Fallback: post the raw review as a single PR-level comment
+      console.error("(log) Failed to parse AI JSON, falling back to single comment:", e.message);
       comments = null;
     }
 
@@ -271,7 +244,6 @@ ${diffBlock}`;
         const commentText = c.comment;
         if (!filePath || !commentText) continue;
 
-        // Find the changeTrackingId for this file
         const fileChange = fileChanges.find((fc) => fc.path === filePath);
 
         const threadBody = {
@@ -290,7 +262,6 @@ ${diffBlock}`;
           },
         };
 
-        // Add pull request thread context if we have the changeTrackingId
         if (fileChange?.changeTrackingId) {
           threadBody.pullRequestThreadContext = {
             changeTrackingId: fileChange.changeTrackingId,
@@ -311,12 +282,12 @@ ${diffBlock}`;
           posted++;
           console.log(`(log) Posted inline comment on ${filePath}:${line}`);
         } else {
-          console.error(`(log) Failed to post comment on ${filePath}:${line}:`, threadRes.status, await threadRes.text());
+          console.error(`(log) Failed to post on ${filePath}:${line}:`, threadRes.status, await threadRes.text());
         }
       }
       console.log(`(log) Posted ${posted}/${comments.length} inline comments on PR ${prId}`);
     } else {
-      // 7b. Fallback: post the raw review as a single PR-level comment
+      // 7b. Fallback: post raw review as a single PR-level comment
       const threadBody = {
         comments: [
           {
@@ -335,7 +306,7 @@ ${diffBlock}`;
       });
 
       if (threadRes.ok) {
-        console.log("(log) Posted PR-level review comment on PR", prId);
+        console.log("(log) Posted PR-level comment on PR", prId);
       } else {
         console.error("(log) Failed to post PR comment:", threadRes.status, await threadRes.text());
       }
