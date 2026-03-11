@@ -272,19 +272,19 @@ async function processReview(payload, env) {
     console.log(`(log) Files to review: ${fileList}`);
     console.log(`(log) Diff size for AI: ${diffBlock.length} chars`);
 
-    const systemPrompt = `You are a senior code reviewer. Review the PR diff below and return a JSON array.
+    const systemPrompt = `You are a senior code reviewer. Review the PR diff and return a JSON array.
 
 OUTPUT FORMAT — respond with ONLY a raw JSON array, no markdown, no code fences:
 [{"file":"/path/to/file.cs","line":42,"comment":"Your feedback"}]
 
 RULES:
 1. "file" must exactly match the file path from the diff header
-2. "line" must be a line number that appears in the diff (the number before the colon on + or space-prefixed lines)
+2. "line" must be a line number shown in the diff (from + or context lines)
 3. Keep each comment concise (1-2 sentences)
 4. Focus on: bugs, null risks, security, performance, logic errors
-5. Skip trivial style issues
-6. Max 5 comments total
-7. If code looks good, return: [{"file":"/path","line":<any valid line>,"comment":"LGTM - code looks clean."}]`;
+5. Skip trivial style issues — do NOT comment on things that are fine
+6. Only flag real issues. If code is clean, return: [{"file":"/path","line":1,"comment":"LGTM"}]
+7. Max 3 comments per file`;
 
     const userPrompt = `PR: "${prTitle}"
 Files changed: ${fileList}
@@ -327,42 +327,52 @@ ${diffBlock}`;
 
     const threadBaseUrl = `${ORG}/${project}/_apis/git/repositories/${repoId}/pullRequests/${prId}/threads?api-version=${AZURE_API_VERSION}`;
 
-    // 7. Post inline comments
+    // 7. Group comments by file and post ONE consolidated inline thread per file
     let posted = 0;
     if (comments && comments.length > 0) {
+      // Group by file path
+      const byFile = {};
       for (const c of comments) {
-        const filePath = c.file;
-        let line = parseInt(c.line, 10);
-        const commentText = c.comment;
-        if (!filePath || !commentText) continue;
+        if (!c.file || !c.comment) continue;
+        if (!byFile[c.file]) byFile[c.file] = [];
+        byFile[c.file].push(c);
+      }
 
+      for (const [filePath, fileComments] of Object.entries(byFile)) {
         const fileChange = fileChanges.find((fc) => fc.path === filePath);
+        const isLgtm = fileComments.every((c) => c.comment?.toLowerCase().includes("lgtm"));
 
-        // Validate line number — must be within the changed lines
-        if (fileChange && !fileChange.changedLines.includes(line)) {
-          // Snap to nearest valid changed line
-          const nearest = fileChange.changedLines.reduce((best, l) =>
-            Math.abs(l - line) < Math.abs(best - line) ? l : best
-          , fileChange.changedLines[0]);
-          console.log(`(log) Snapping line ${line} -> ${nearest} for ${filePath}`);
-          line = nearest;
+        // Skip posting if every comment is just LGTM — it'll show in the summary
+        if (isLgtm) continue;
+
+        // Pick the first changed line as the anchor for the thread
+        let anchorLine = parseInt(fileComments[0].line, 10) || 1;
+        if (fileChange && !fileChange.changedLines.includes(anchorLine)) {
+          anchorLine = fileChange.changedLines[0] || 1;
         }
 
-        if (!line || line < 1) line = 1;
+        // Build consolidated comment body
+        const fileName = filePath.split("/").pop();
+        let body = `🤖 **AI Review — \`${fileName}\`**\n\n`;
+        for (const c of fileComments) {
+          const line = parseInt(c.line, 10);
+          if (c.comment.toLowerCase().includes("lgtm")) continue;
+          body += `- **Line ${line}:** ${c.comment}\n`;
+        }
 
         const threadBody = {
           comments: [
             {
               parentCommentId: 0,
-              content: `🤖 **AI Review**\n\n${commentText}`,
+              content: body.trim(),
               commentType: 1,
             },
           ],
           status: 4,
           threadContext: {
             filePath,
-            rightFileStart: { line, offset: 1 },
-            rightFileEnd: { line, offset: 1 },
+            rightFileStart: { line: anchorLine, offset: 1 },
+            rightFileEnd: { line: anchorLine, offset: 1 },
           },
         };
 
@@ -384,10 +394,10 @@ ${diffBlock}`;
 
         if (threadRes.ok) {
           posted++;
-          console.log(`(log) ✓ Inline comment on ${filePath}:${line}`);
+          console.log(`(log) ✓ Consolidated comment on ${filePath} (${fileComments.length} items)`);
         } else {
           const errBody = await threadRes.text();
-          console.error(`(log) ✗ Failed ${filePath}:${line} (${threadRes.status}): ${errBody}`);
+          console.error(`(log) ✗ Failed ${filePath} (${threadRes.status}): ${errBody}`);
         }
       }
     }
@@ -414,7 +424,7 @@ ${diffBlock}`;
     }
 
     if (posted > 0) {
-      summaryLines.push("", `📝 **${posted} inline comment(s)** posted on specific lines above.`);
+      summaryLines.push("", `📝 **${posted} file review(s)** posted as inline comments.`);
     } else if (comments === null) {
       // AI response couldn't be parsed — include it in the summary
       summaryLines.push("", "### Review", "", rawReview || "No review content returned.");
