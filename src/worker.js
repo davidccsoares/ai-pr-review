@@ -125,7 +125,7 @@ function computeHunks(oldText, newText) {
 
   // 3. Format hunks
   const output = [];
-  const changedLines = []; // Track actual new-file line numbers that were changed
+  const changedLines = []; // All line numbers visible in the diff (changed + context)
 
   for (const hunk of merged) {
     const ctxBefore = Math.max(0, hunk.newStart - CONTEXT_LINES);
@@ -136,6 +136,7 @@ function computeHunks(oldText, newText) {
     // Context before
     for (let c = ctxBefore; c < hunk.newStart; c++) {
       output.push(` ${c + 1}: ${newLines[c]}`);
+      changedLines.push(c + 1);
     }
 
     // Removed lines (from old file)
@@ -152,6 +153,7 @@ function computeHunks(oldText, newText) {
     // Context after
     for (let c = hunk.newEnd; c < ctxAfter; c++) {
       output.push(` ${c + 1}: ${newLines[c]}`);
+      changedLines.push(c + 1);
     }
 
     output.push("---");
@@ -238,6 +240,7 @@ async function processReview(payload, env) {
       }
 
       if (diff) {
+        console.log(`(log) ${path}: ${changedLines.length} lines in diff [${changedLines.slice(0, 10).join(",")}...]`);
         fileChanges.push({
           path,
           changeTrackingId,
@@ -257,8 +260,7 @@ async function processReview(payload, env) {
     let diffBlock = "";
     for (const fc of fileChanges) {
       const header = `\n### FILE: ${fc.path} (${fc.isAdd ? "new file" : "edited"})`;
-      const validLines = `\nValid line numbers for comments: [${fc.changedLines.slice(0, 30).join(", ")}]`;
-      const section = `${header}${validLines}\n\`\`\`\n${fc.diff}\n\`\`\`\n`;
+      const section = `${header}\n\`\`\`\n${fc.diff}\n\`\`\`\n`;
       if (diffBlock.length + section.length > MAX_DIFF_SIZE) {
         console.log("(log) Diff budget reached, skipping remaining files");
         break;
@@ -270,19 +272,19 @@ async function processReview(payload, env) {
     console.log(`(log) Files to review: ${fileList}`);
     console.log(`(log) Diff size for AI: ${diffBlock.length} chars`);
 
-    const systemPrompt = `You are a senior code reviewer. Review the PR diff below and return structured JSON.
+    const systemPrompt = `You are a senior code reviewer. Review the PR diff below and return a JSON array.
 
-OUTPUT FORMAT — respond with ONLY a JSON array, nothing else:
-[{"file":"/path","line":42,"comment":"Your feedback here"}]
+OUTPUT FORMAT — respond with ONLY a raw JSON array, no markdown, no code fences:
+[{"file":"/path/to/file.cs","line":42,"comment":"Your feedback"}]
 
 RULES:
-1. "file" must exactly match the file path shown in the diff header
-2. "line" MUST be one of the valid line numbers listed for that file (from the "+" added lines)
+1. "file" must exactly match the file path from the diff header
+2. "line" must be a line number that appears in the diff (the number before the colon on + or space-prefixed lines)
 3. Keep each comment concise (1-2 sentences)
-4. Focus on: bugs, null/undefined risks, security, performance, logic errors
+4. Focus on: bugs, null risks, security, performance, logic errors
 5. Skip trivial style issues
-6. Max 5 comments total across all files
-7. If code is fine, return: [{"file":"/path","line":1,"comment":"LGTM"}]`;
+6. Max 5 comments total
+7. If code looks good, return: [{"file":"/path","line":<any valid line>,"comment":"LGTM - code looks clean."}]`;
 
     const userPrompt = `PR: "${prTitle}"
 Files changed: ${fileList}
@@ -299,14 +301,24 @@ ${diffBlock}`;
       max_tokens: 1024,
     });
 
-    const rawReview = aiResponse?.response || "";
+    // Workers AI may return a parsed object or a string depending on the model
+    const rawResponse = aiResponse?.response;
+    const rawReview = typeof rawResponse === "string"
+      ? rawResponse
+      : JSON.stringify(rawResponse, null, 2);
     console.log("(log) AI response:", rawReview);
 
-    // 6. Parse response
+    // 6. Parse response — handle both already-parsed and string responses
     let comments;
     try {
-      const jsonMatch = rawReview.match(/\[[\s\S]*?\]/);
-      comments = jsonMatch ? JSON.parse(jsonMatch[0]) : [];
+      if (Array.isArray(rawResponse)) {
+        comments = rawResponse;
+      } else if (typeof rawResponse === "string") {
+        const jsonMatch = rawResponse.match(/\[[\s\S]*?\]/);
+        comments = jsonMatch ? JSON.parse(jsonMatch[0]) : [];
+      } else {
+        comments = [];
+      }
       if (!Array.isArray(comments)) comments = [];
     } catch (e) {
       console.error("(log) JSON parse failed:", e.message);
