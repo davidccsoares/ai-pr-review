@@ -118,6 +118,24 @@ function computeDiff(oldText, newText) {
   return { diff: output.join("\n"), changedLines };
 }
 
+// ─── Risk Scoring ────────────────────────────────────────────────────────────
+
+function calculateRisk(fileChanges, totalChangedLines) {
+  let score = 0;
+  score += fileChanges.length * 2;
+  score += Math.floor(totalChangedLines / 10);
+  for (const fc of fileChanges) {
+    if (fc.diff.length > 1500) score += 3;
+  }
+  return Math.min(score, 100);
+}
+
+function riskLevel(score) {
+  if (score < 15) return "LOW";
+  if (score < 35) return "MEDIUM";
+  return "HIGH";
+}
+
 // ─── Main Review Logic ──────────────────────────────────────────────────────
 
 async function processReview(payload, env) {
@@ -158,6 +176,7 @@ async function processReview(payload, env) {
 
     // 3. For each changed file, compute diff
     const fileChanges = [];
+    let totalChangedLines = 0;
 
     for (const c of entries) {
       const path = c.item?.path;
@@ -195,6 +214,7 @@ async function processReview(payload, env) {
       }
 
       if (diff) {
+        totalChangedLines += changedLines.length;
         console.log(`(log) ${path}: changed lines [${changedLines.slice(0, 15).join(",")}...]`);
         fileChanges.push({
           path,
@@ -226,6 +246,40 @@ async function processReview(payload, env) {
     const fileList = fileChanges.map((fc) => fc.path).join(", ");
     console.log(`(log) Files to review: ${fileList}`);
     console.log(`(log) Diff size for AI: ${diffBlock.length} chars`);
+
+    // 4a. Compute risk score
+    const riskScore = calculateRisk(fileChanges, totalChangedLines);
+    const risk = riskLevel(riskScore);
+    console.log(`(log) Risk score: ${riskScore}/100 (${risk})`);
+
+    // 4b. Compute largest file changes (top 3 by diff length)
+    const largestFiles = [...fileChanges]
+      .sort((a, b) => b.diff.length - a.diff.length)
+      .slice(0, 3)
+      .map((fc) => fc.path);
+    console.log(`(log) Largest changes: ${largestFiles.join(", ")}`);
+
+    // 4c. AI PR summary (only for large PRs)
+    let prSummary = null;
+    if (diffBlock.length > 2000) {
+      console.log("(log) Large PR detected, generating AI summary...");
+      const summaryAiResponse = await env.AI.run(CF_AI_MODEL, {
+        messages: [
+          { role: "system", content: "You summarize pull requests." },
+          {
+            role: "user",
+            content: `Explain this pull request in 3 concise bullet points.\n\nPR title: ${prTitle}\n\nChanges:\n${diffBlock.substring(0, 4000)}`,
+          },
+        ],
+        max_tokens: 200,
+      });
+      prSummary = summaryAiResponse?.response || null;
+      if (prSummary) {
+        console.log("(log) PR summary generated");
+      }
+    } else {
+      console.log("(log) Small PR, skipping AI summary");
+    }
 
     const systemPrompt = `You are a senior code reviewer. Review ONLY the changed lines in the PR diff below.
 
@@ -296,7 +350,33 @@ ${diffBlock}`;
     const threadBaseUrl = `${ORG}/${project}/_apis/git/repositories/${repoId}/pullRequests/${prId}/threads?api-version=${AZURE_API_VERSION}`;
 
     // 7. Build a single PR-level summary comment
-    const summary = [`## 🤖 AI Code Review`, ``, `**PR:** ${prTitle}  `, `**Files reviewed:** ${fileChanges.length}`, ``];
+    const summary = [`## 🤖 AI Code Review`, ``];
+
+    // PR Summary (only for large PRs)
+    if (prSummary) {
+      summary.push(`### 📋 PR Summary`, ``, prSummary, ``);
+    }
+
+    // Risk Analysis
+    summary.push(
+      `### ⚠ Risk Analysis`,
+      ``,
+      `Score: **${riskScore}/100**`,
+      `Level: **${risk}**`,
+      ``,
+      `Files reviewed: ${fileChanges.length}`,
+      ``
+    );
+
+    // Largest Changes
+    if (largestFiles.length > 0) {
+      summary.push(`### Largest Changes`, ``);
+      for (const f of largestFiles) {
+        const fileName = f.split("/").pop();
+        summary.push(`* ${fileName}`);
+      }
+      summary.push(``);
+    }
 
     if (comments && comments.length > 0) {
       const byFile = {};
