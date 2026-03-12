@@ -439,7 +439,7 @@ async function processReview(payload, env) {
     }
 
     const systemPrompt = `You are a senior code reviewer. Review ONLY the changed lines in the PR diff below.
-${backlogContext ? "\nYou will also receive linked product backlog items (user stories, tasks, bugs). Use them to understand the INTENT behind the changes and validate the code aligns with the requirements.\n" : ""}
+${backlogContext ? "\nYou will also receive linked product backlog items (user stories, tasks, bugs). Use them to:\n- Understand the INTENT behind the changes and validate the code aligns with the requirements.\n- Check if the code changes are actually RELEVANT to the linked work items. If the work item describes a completely different feature or task than what the code changes implement, flag this mismatch.\n" : ""}
 OUTPUT FORMAT — respond with ONLY a raw JSON array, no markdown, no code fences:
 [{"file":"/path/to/file.cs","line":42,"comment":"Your feedback"}]
 
@@ -454,7 +454,7 @@ RULES:
 8. Do NOT guess or speculate — only flag issues you are certain about
 9. Do NOT comment on code style, naming, or formatting
 10. If the changed code looks correct, return: [{"file":"/path","line":1,"comment":"LGTM"}]
-11. Do NOT flag syntax errors like missing braces, unmatched if/else, or try/catch structure — the diff shows partial code and the IDE already catches these${backlogContext ? "\n12. If the code contradicts or clearly misses a requirement from the linked work items, flag it" : ""}`;
+11. Do NOT flag syntax errors like missing braces, unmatched if/else, or try/catch structure — the diff shows partial code and the IDE already catches these${backlogContext ? "\n12. If the code contradicts or clearly misses a requirement from the linked work items, flag it\n13. If the linked work items describe a DIFFERENT feature/task than what the code actually does, add a comment on the first changed line: \"⚠️ Backlog mismatch: the linked work item is about [X] but this code changes [Y]. Verify the correct work item is linked to this PR.\"" : ""}`;
 
     const userPrompt = `PR: "${prTitle}"
 Files changed: ${fileList}
