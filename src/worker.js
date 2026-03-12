@@ -3,7 +3,7 @@ const AZURE_API_VERSION = "7.0";
 const MAX_DIFF_SIZE = 10000;
 const MAX_FILE_DIFF = 4000;
 const MAX_BACKLOG_SIZE = 3000;
-const CONTEXT_LINES = 3;
+const CONTEXT_LINES = 10;
 const CF_AI_MODEL = "@cf/qwen/qwen2.5-coder-32b-instruct";
 
 export default {
@@ -453,7 +453,8 @@ RULES:
 7. Focus on: actual bugs, null reference risks, security vulnerabilities, clear logic errors
 8. Do NOT guess or speculate — only flag issues you are certain about
 9. Do NOT comment on code style, naming, or formatting
-10. If the changed code looks correct, return: [{"file":"/path","line":1,"comment":"LGTM"}]${backlogContext ? "\n11. If the code contradicts or clearly misses a requirement from the linked work items, flag it" : ""}`;
+10. If the changed code looks correct, return: [{"file":"/path","line":1,"comment":"LGTM"}]
+11. Do NOT flag syntax errors like missing braces, unmatched if/else, or try/catch structure — the diff shows partial code and the IDE already catches these${backlogContext ? "\n12. If the code contradicts or clearly misses a requirement from the linked work items, flag it" : ""}`;
 
     const userPrompt = `PR: "${prTitle}"
 Files changed: ${fileList}
