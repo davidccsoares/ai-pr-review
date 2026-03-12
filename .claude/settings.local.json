@@ -3,7 +3,9 @@
     "allow": [
       "Bash(cd \"C:\\\\Users\\\\david\\\\ai-pr-review\" && npx wrangler deploy --dry-run --outdir=.wrangler/tmp-check 2>&1)",
       "Bash(cd \"C:\\\\Users\\\\david\\\\ai-pr-review\" && npx wrangler deploy 2>&1)",
-      "WebFetch(domain:developers.cloudflare.com)"
+      "WebFetch(domain:developers.cloudflare.com)",
+      "Bash(npx wrangler:*)",
+      "Bash(git add:*)"
     ]
   }
 }
