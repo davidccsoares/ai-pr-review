@@ -261,7 +261,7 @@ async function processReview(payload, env) {
 
     // 4c. AI PR summary (only for large PRs)
     let prSummary = null;
-    if (diffBlock.length > 2000) {
+    if (diffBlock.length > 5000) {
       console.log("(log) Large PR detected, generating AI summary...");
       const summaryAiResponse = await env.AI.run(CF_AI_MODEL, {
         messages: [
