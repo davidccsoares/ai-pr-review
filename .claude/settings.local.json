@@ -5,7 +5,8 @@
       "Bash(cd \"C:\\\\Users\\\\david\\\\ai-pr-review\" && npx wrangler deploy 2>&1)",
       "WebFetch(domain:developers.cloudflare.com)",
       "Bash(npx wrangler:*)",
-      "Bash(git add:*)"
+      "Bash(git add:*)",
+      "Bash(npx vitest:*)"
     ]
   }
 }

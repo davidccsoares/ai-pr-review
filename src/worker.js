@@ -2,6 +2,7 @@ const ORG = "https://dev.azure.com/bindtuning";
 const AZURE_API_VERSION = "7.0";
 const MAX_DIFF_SIZE = 10000;
 const MAX_FILE_DIFF = 4000;
+const MAX_BACKLOG_SIZE = 3000;
 const CONTEXT_LINES = 3;
 const CF_AI_MODEL = "@cf/qwen/qwen2.5-coder-32b-instruct";
 
@@ -39,6 +40,154 @@ async function fetchFileAtCommit(project, repoId, path, commitId, headers) {
   const res = await fetch(url, { headers });
   if (!res.ok) return null;
   return res.text();
+}
+
+// ─── Backlog / Work Items ────────────────────────────────────────────────────
+
+function stripHtml(html) {
+  if (!html) return "";
+  return html
+    .replace(/<br\s*\/?>/gi, "\n")
+    .replace(/<\/?(p|div|li|ul|ol|h[1-6])[^>]*>/gi, "\n")
+    .replace(/<[^>]*>/g, "")
+    .replace(/&nbsp;/g, " ")
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+/**
+ * Fetch work items linked to a PR, then walk up to parent user stories.
+ * Returns an array of { id, type, title, description, acceptanceCriteria, parent? }.
+ */
+async function fetchLinkedWorkItems(project, repoId, prId, headers) {
+  try {
+    // 1. Get work item refs linked to the PR
+    const refsUrl = `${ORG}/${project}/_apis/git/repositories/${repoId}/pullRequests/${prId}/workitems?api-version=${AZURE_API_VERSION}`;
+    const refsRes = await fetch(refsUrl, { headers });
+    if (!refsRes.ok) {
+      console.log("(log) Could not fetch PR work item refs:", refsRes.status);
+      return [];
+    }
+    const refsData = await refsRes.json();
+    const refs = refsData.value || [];
+    if (refs.length === 0) return [];
+
+    // 2. Batch-fetch full work item details (with relations so we can find parents)
+    const ids = refs.map((r) => r.id).join(",");
+    const wiUrl = `${ORG}/${project}/_apis/wit/workitems?ids=${ids}&$expand=relations&api-version=${AZURE_API_VERSION}`;
+    const wiRes = await fetch(wiUrl, { headers });
+    if (!wiRes.ok) {
+      console.log("(log) Could not fetch work item details:", wiRes.status);
+      return [];
+    }
+    const wiData = await wiRes.json();
+    const workItems = (wiData.value || []).map((wi) => ({
+      id: wi.id,
+      type: wi.fields["System.WorkItemType"],
+      title: wi.fields["System.Title"],
+      state: wi.fields["System.State"],
+      description: stripHtml(wi.fields["System.Description"]),
+      acceptanceCriteria: stripHtml(
+        wi.fields["Microsoft.VSAT.Common.AcceptanceCriteria"] || ""
+      ),
+      tags: wi.fields["System.Tags"] || "",
+      _relations: wi.relations || [],
+    }));
+
+    // 3. For tasks/bugs, try to fetch the parent user story / feature
+    const parentIds = new Set();
+    for (const wi of workItems) {
+      const parentRel = wi._relations.find(
+        (r) => r.rel === "System.LinkTypes.Hierarchy-Reverse"
+      );
+      if (parentRel) {
+        const parentId = parentRel.url.split("/").pop();
+        if (!refs.some((r) => String(r.id) === parentId)) {
+          parentIds.add(parentId);
+        }
+      }
+    }
+
+    let parentMap = {};
+    if (parentIds.size > 0) {
+      const parentIdsStr = [...parentIds].join(",");
+      const parentUrl = `${ORG}/${project}/_apis/wit/workitems?ids=${parentIdsStr}&api-version=${AZURE_API_VERSION}`;
+      const parentRes = await fetch(parentUrl, { headers });
+      if (parentRes.ok) {
+        const parentData = await parentRes.json();
+        for (const pw of parentData.value || []) {
+          parentMap[pw.id] = {
+            id: pw.id,
+            type: pw.fields["System.WorkItemType"],
+            title: pw.fields["System.Title"],
+            description: stripHtml(pw.fields["System.Description"]),
+            acceptanceCriteria: stripHtml(
+              pw.fields["Microsoft.VSAT.Common.AcceptanceCriteria"] || ""
+            ),
+          };
+        }
+      }
+    }
+
+    // 4. Attach parent info and clean up internal fields
+    return workItems.map((wi) => {
+      const parentRel = wi._relations.find(
+        (r) => r.rel === "System.LinkTypes.Hierarchy-Reverse"
+      );
+      const parentId = parentRel ? parentRel.url.split("/").pop() : null;
+      const { _relations, ...clean } = wi;
+      return {
+        ...clean,
+        parent: parentId ? parentMap[parentId] || null : null,
+      };
+    });
+  } catch (err) {
+    console.error("(log) Error fetching work items:", err.message);
+    return [];
+  }
+}
+
+/**
+ * Build a backlog context string from work items, respecting MAX_BACKLOG_SIZE.
+ */
+function buildBacklogContext(workItems) {
+  if (workItems.length === 0) return "";
+
+  let context = "\n## Linked Work Items (Product Backlog)\n";
+
+  for (const wi of workItems) {
+    let section = `\n### ${wi.type} #${wi.id}: ${wi.title}`;
+    section += `\nState: ${wi.state}`;
+    if (wi.tags) section += ` | Tags: ${wi.tags}`;
+    section += "\n";
+
+    if (wi.description) {
+      section += `**Description:** ${wi.description.substring(0, 500)}\n`;
+    }
+    if (wi.acceptanceCriteria) {
+      section += `**Acceptance Criteria:** ${wi.acceptanceCriteria.substring(0, 500)}\n`;
+    }
+
+    // Include parent user story if available
+    if (wi.parent) {
+      section += `\n> **Parent ${wi.parent.type} #${wi.parent.id}:** ${wi.parent.title}\n`;
+      if (wi.parent.acceptanceCriteria) {
+        section += `> **Parent Acceptance Criteria:** ${wi.parent.acceptanceCriteria.substring(0, 400)}\n`;
+      }
+    }
+
+    if (context.length + section.length > MAX_BACKLOG_SIZE) {
+      console.log("(log) Backlog budget reached, skipping remaining items");
+      break;
+    }
+    context += section;
+  }
+
+  return context;
 }
 
 /**
@@ -174,6 +323,14 @@ async function processReview(payload, env) {
     const changesData = await changesRes.json();
     const entries = changesData.changeEntries || changesData.changes || [];
 
+    // 2b. Fetch linked work items (product backlog)
+    const workItems = await fetchLinkedWorkItems(project, repoId, prId, azureHeaders);
+    console.log(`(log) Linked work items: ${workItems.length}`);
+    const backlogContext = buildBacklogContext(workItems);
+    if (backlogContext) {
+      console.log(`(log) Backlog context size: ${backlogContext.length} chars`);
+    }
+
     // 3. For each changed file, compute diff
     const fileChanges = [];
     let totalChangedLines = 0;
@@ -282,7 +439,7 @@ async function processReview(payload, env) {
     }
 
     const systemPrompt = `You are a senior code reviewer. Review ONLY the changed lines in the PR diff below.
-
+${backlogContext ? "\nYou will also receive linked product backlog items (user stories, tasks, bugs). Use them to understand the INTENT behind the changes and validate the code aligns with the requirements.\n" : ""}
 OUTPUT FORMAT — respond with ONLY a raw JSON array, no markdown, no code fences:
 [{"file":"/path/to/file.cs","line":42,"comment":"Your feedback"}]
 
@@ -296,11 +453,11 @@ RULES:
 7. Focus on: actual bugs, null reference risks, security vulnerabilities, clear logic errors
 8. Do NOT guess or speculate — only flag issues you are certain about
 9. Do NOT comment on code style, naming, or formatting
-10. If the changed code looks correct, return: [{"file":"/path","line":1,"comment":"LGTM"}]`;
+10. If the changed code looks correct, return: [{"file":"/path","line":1,"comment":"LGTM"}]${backlogContext ? "\n11. If the code contradicts or clearly misses a requirement from the linked work items, flag it" : ""}`;
 
     const userPrompt = `PR: "${prTitle}"
 Files changed: ${fileList}
-
+${backlogContext}
 ${diffBlock}`;
 
     // 5. Call Cloudflare Workers AI
@@ -374,6 +531,18 @@ ${diffBlock}`;
       for (const f of largestFiles) {
         const fileName = f.split("/").pop();
         summary.push(`* ${fileName}`);
+      }
+      summary.push(``);
+    }
+
+    // Linked Work Items
+    if (workItems.length > 0) {
+      summary.push(`### 📋 Linked Work Items`, ``);
+      for (const wi of workItems) {
+        summary.push(`* **${wi.type} #${wi.id}:** ${wi.title} (${wi.state})`);
+        if (wi.parent) {
+          summary.push(`  * ↳ Parent: **${wi.parent.type} #${wi.parent.id}:** ${wi.parent.title}`);
+        }
       }
       summary.push(``);
     }
