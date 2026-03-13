@@ -734,7 +734,10 @@ async function fetchAndDiffFiles(files, project, repoId, sourceCommit, targetCom
       // Debug: log the raw diff blocks
       for (const fd of fileDiffsData) {
         const blocks = fd.lineDiffBlocks || [];
-        const nonZero = blocks.filter(b => b.changeType !== 0);
+        const nonZero = blocks.filter(b => {
+          const ct = typeof b.changeType === "string" ? b.changeType.toLowerCase() : b.changeType;
+          return ct !== 0 && ct !== "none";
+        });
         console.log(`(log) File diffs for "${fd.path}": ${blocks.length} total blocks, ${nonZero.length} changed blocks`);
         for (const b of nonZero.slice(0, 10)) {
           console.log(`(log)   block: changeType=${b.changeType} origStart=${b.originalLineNumberStart} origCount=${b.originalLinesCount} modStart=${b.modifiedLineNumberStart} modCount=${b.modifiedLinesCount}`);
@@ -794,15 +797,17 @@ async function fetchAndDiffFiles(files, project, repoId, sourceCommit, targetCom
     }
 
     // Build hunks from Azure's lineDiffBlocks
-    // changeType: 0=None, 1=Add, 2=Delete, 3=Edit (we want 1 and 3 for new lines)
+    // changeType can be a number (0=None,1=Add,2=Delete,3=Edit) or string ("none","add","delete","edit")
     const output = [];
     const changedLines = [];
 
     for (const block of blocks) {
-      if (block.changeType === 0) continue; // no change
+      const ct = typeof block.changeType === "string" ? block.changeType.toLowerCase() : block.changeType;
+      if (ct === 0 || ct === "none") continue; // no change
 
       const modStart = block.modifiedLineNumberStart; // 1-based
       const modCount = block.modifiedLinesCount;
+      const isDelete = ct === 2 || ct === "delete";
 
       // Context: show a few lines before and after the changed range
       const ctxBefore = Math.max(0, modStart - 1 - CONTEXT_LINES);
@@ -815,7 +820,7 @@ async function fetchAndDiffFiles(files, project, repoId, sourceCommit, targetCom
         const isChanged = lineNum >= modStart && lineNum < modStart + modCount;
 
         if (isChanged) {
-          if (block.changeType === 2) {
+          if (isDelete) {
             // Pure delete — line exists in old file, not in new
             output.push(`-${lineNum}: (deleted)`);
           } else {
