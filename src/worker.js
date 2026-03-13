@@ -1,10 +1,12 @@
 const ORG = "https://dev.azure.com/bindtuning";
 const AZURE_API_VERSION = "7.0";
-const MAX_DIFF_SIZE = 10000;
-const MAX_FILE_DIFF = 4000;
+const MAX_DIFF_SIZE = 60000;
+const MAX_FILE_DIFF = 3000;
 const MAX_BACKLOG_SIZE = 3000;
 const CONTEXT_LINES = 10;
-const CF_AI_MODEL = "@cf/qwen/qwen2.5-coder-32b-instruct";
+const MAX_BATCH_FILES = 20;
+const MAX_BATCHES = 15;
+const CF_AI_MODEL = "@cf/mistralai/mistral-small-3.1-24b-instruct";
 
 export default {
   async fetch(request, env, ctx) {
@@ -21,12 +23,19 @@ export default {
 
     console.log("(log) Webhook received");
 
+    // Batch continuation routing — self-calls from previous batch
+    if (payload.__isBatchContinuation) {
+      console.log(`(log) Batch continuation #${payload.batchNumber} received`);
+      ctx.waitUntil(processBatch(payload, env, request));
+      return new Response("Batch accepted", { status: 202 });
+    }
+
     if (!payload?.resource?.pullRequestId) {
       console.log("(log) No pull request ID found");
       return new Response("No PR", { status: 200 });
     }
 
-    ctx.waitUntil(processReview(payload, env));
+    ctx.waitUntil(processReview(payload, env, request));
     return new Response("Accepted", { status: 202 });
   },
 };
@@ -269,6 +278,148 @@ function computeDiff(oldText, newText) {
 
 // ─── Risk Scoring ────────────────────────────────────────────────────────────
 
+// ─── File Classifier (zero subrequests — path-only) ─────────────────────────
+
+const SKIP_PATTERNS = [
+  // ── Lock files & package managers ──
+  /package-lock\.json$/i, /yarn\.lock$/i, /pnpm-lock\.yaml$/i,
+  // ── C# generated / build artifacts ──
+  /\.designer\.cs$/i, /\.g\.cs$/i, /\.g\.i\.cs$/i, /\.generated\.cs$/i,
+  /AssemblyInfo\.cs$/i,
+  /\.csproj$/i, /\.sln$/i, /\.suo$/i, /\.user$/i,
+  /\/bin\//, /\/obj\//,
+  /\/migrations\//i, /\.migration\.cs$/i,
+  /\.resx$/i, /\.xaml$/i,
+  /appsettings(\.\w+)?\.json$/i, /launchSettings\.json$/i,
+  // ── JS/TS build output & minified ──
+  /\.min\.js$/i, /\.min\.css$/i, /\.bundle\.js$/i,
+  /\/dist\//, /\/node_modules\//, /\/lib\//, /\/coverage\//,
+  // ── Angular noise ──
+  /angular\.json$/i, /karma\.conf\.js$/i, /protractor\.conf\.js$/i,
+  /polyfills\.ts$/i, /environment\.(prod|dev|staging)\.ts$/i,
+  /\.browserslistrc$/i,
+  // ── SPFx noise ──
+  /\.manifest\.json$/i, /\.yo-rc\.json$/i,
+  /\/config\/(config|deploy-azure-storage|package-solution|serve|write-manifests)\.json$/i,
+  /gulpfile\.js$/i,
+  /\/loc\/[^/]+\.(d\.ts|js)$/i,
+  // ── Binary / media / fonts ──
+  /\.(png|jpg|jpeg|gif|svg|ico|woff|woff2|ttf|eot|mp4|mp3|zip|pdf|webp)$/i,
+  // ── Docs, config boilerplate ──
+  /\.md$/i, /\.txt$/i, /LICENSE/i, /\.gitignore$/i, /\.gitattributes$/i,
+  /\.editorconfig$/i, /\.prettierrc/i, /\.eslintrc/i, /tsconfig.*\.json$/i,
+  /\.dockerignore$/i, /Dockerfile$/i, /docker-compose/i,
+  /tslint\.json$/i, /\.npmignore$/i,
+];
+
+const HIGH_EXTENSIONS = /\.(cs|ts|tsx|js|jsx|py|go|rs|java|kt|rb|swift|vue|svelte)$/i;
+const LOW_EXTENSIONS = /\.(test\.|spec\.|tests\.|_test\.|_spec\.)/i;
+const LOW_PATHS = /\/(tests?|__tests__|specs?|testing|stylesheets?|styles|e2e)\//i;
+const LOW_FILE_EXTENSIONS = /\.(css|scss|sass|less)$/i;
+
+// Angular component templates have real logic — treat as HIGH, not LOW
+const ANGULAR_TEMPLATE = /\.component\.html$/i;
+
+const PRIORITY_KEYWORDS = [
+  // ── C# backend ──
+  { pattern: /(controller|handler|endpoint)/i, score: 10 },
+  { pattern: /(service|repository|provider|manager)/i, score: 8 },
+  { pattern: /(middleware|filter|interceptor|guard|attribute)/i, score: 7 },
+  { pattern: /(startup|program)\.cs$/i, score: 7 },
+  { pattern: /(model|entity|schema|dto|viewmodel)/i, score: 5 },
+  // ── Angular ──
+  { pattern: /\.component\.ts$/i, score: 9 },
+  { pattern: /\.service\.ts$/i, score: 8 },
+  { pattern: /\.guard\.ts$/i, score: 7 },
+  { pattern: /\.interceptor\.ts$/i, score: 7 },
+  { pattern: /\.resolver\.ts$/i, score: 7 },
+  { pattern: /\.directive\.ts$/i, score: 6 },
+  { pattern: /\.pipe\.ts$/i, score: 5 },
+  { pattern: /\.module\.ts$/i, score: 4 },
+  { pattern: /\.component\.html$/i, score: 6 },
+  // ── SPFx ──
+  { pattern: /WebPart\.ts$/i, score: 9 },
+  { pattern: /\.extension\.ts$/i, score: 8 },
+  { pattern: /\.command\.ts$/i, score: 8 },
+  // ── General ──
+  { pattern: /(api|route)/i, score: 9 },
+  { pattern: /(util|helper|extension|config)/i, score: 3 },
+];
+
+/**
+ * Classify all files by path alone (zero subrequests).
+ * Returns { skip: [...], high: [...], low: [...] }
+ * High files are sorted by priority score (highest first).
+ */
+function classifyFiles(entries) {
+  const skip = [];
+  const high = [];
+  const low = [];
+
+  for (const c of entries) {
+    const path = c.item?.path;
+    const changeType = c.changeType;
+
+    if (!path || path.endsWith("/")) continue;
+
+    const ct = typeof changeType === "string" ? changeType.toLowerCase() : changeType;
+    const isEdit = ct === "edit" || ct === 2;
+    const isAdd = ct === "add" || ct === 1;
+    if (!isEdit && !isAdd) continue;
+
+    const fileInfo = { path, changeType: ct, isEdit, isAdd, changeTrackingId: c.changeTrackingId };
+
+    // Check SKIP patterns
+    if (SKIP_PATTERNS.some((re) => re.test(path))) {
+      skip.push(fileInfo);
+      continue;
+    }
+
+    // Angular component templates have real logic — treat as HIGH
+    if (ANGULAR_TEMPLATE.test(path)) {
+      let priorityScore = 6;
+      for (const kw of PRIORITY_KEYWORDS) {
+        if (kw.pattern.test(path)) {
+          priorityScore = Math.max(priorityScore, kw.score);
+        }
+      }
+      fileInfo.priorityScore = priorityScore;
+      high.push(fileInfo);
+      continue;
+    }
+
+    // Check LOW patterns (tests, styles, etc.)
+    if (LOW_EXTENSIONS.test(path) || LOW_PATHS.test(path) || LOW_FILE_EXTENSIONS.test(path)) {
+      low.push(fileInfo);
+      continue;
+    }
+
+    // Check HIGH extensions
+    if (HIGH_EXTENSIONS.test(path)) {
+      // Calculate priority score
+      let priorityScore = 1;
+      for (const kw of PRIORITY_KEYWORDS) {
+        if (kw.pattern.test(path)) {
+          priorityScore = Math.max(priorityScore, kw.score);
+        }
+      }
+      fileInfo.priorityScore = priorityScore;
+      high.push(fileInfo);
+      continue;
+    }
+
+    // Default: treat as low priority
+    low.push(fileInfo);
+  }
+
+  // Sort HIGH files: highest priority first
+  high.sort((a, b) => b.priorityScore - a.priorityScore);
+
+  return { skip, high, low };
+}
+
+// ─── Risk Scoring (original) ─────────────────────────────────────────────────
+
 function calculateRisk(fileChanges, totalChangedLines) {
   let score = 0;
   score += fileChanges.length * 2;
@@ -287,158 +438,74 @@ function riskLevel(score) {
 
 // ─── Main Review Logic ──────────────────────────────────────────────────────
 
-async function processReview(payload, env) {
-  try {
-    const prId = payload.resource.pullRequestId;
-    const repoId = payload.resource.repository.id;
-    const project = payload.resource.repository.project.name;
-    const prTitle = payload.resource.title || "";
-    const sourceCommit = payload.resource.lastMergeSourceCommit.commitId;
-    const targetCommit = payload.resource.lastMergeTargetCommit.commitId;
+// ─── Batch Helper: Fetch + Diff a batch of files ────────────────────────────
 
-    console.log(`(log) Processing PR ${prId}: "${prTitle}"`);
-    console.log(`(log) Source: ${sourceCommit} | Target: ${targetCommit}`);
+async function fetchAndDiffFiles(files, project, repoId, sourceCommit, targetCommit, azureHeaders) {
+  const fileChanges = [];
+  let totalChangedLines = 0;
 
-    const azureHeaders = {
-      Authorization: `Basic ${btoa(":" + env.AZURE_TOKEN)}`,
-    };
+  for (const f of files) {
+    console.log(`(log) Processing file (${f.isAdd ? "add" : "edit"}): ${f.path}`);
 
-    // 1. Get latest iteration
-    const iterUrl = `${ORG}/${project}/_apis/git/repositories/${repoId}/pullRequests/${prId}/iterations?api-version=${AZURE_API_VERSION}`;
-    const iterRes = await fetch(iterUrl, { headers: azureHeaders });
-    if (!iterRes.ok) {
-      console.error("(log) Failed to fetch iterations:", iterRes.status);
-      return;
-    }
-    const iterData = await iterRes.json();
-    const latestIteration = Math.max(...iterData.value.map((i) => i.id));
+    const [oldContent, newContent] = await Promise.all([
+      f.isEdit ? fetchFileAtCommit(project, repoId, f.path, targetCommit, azureHeaders) : Promise.resolve(null),
+      fetchFileAtCommit(project, repoId, f.path, sourceCommit, azureHeaders),
+    ]);
 
-    // 2. Get changed files
-    const changesUrl = `${ORG}/${project}/_apis/git/repositories/${repoId}/pullRequests/${prId}/iterations/${latestIteration}/changes?api-version=${AZURE_API_VERSION}`;
-    const changesRes = await fetch(changesUrl, { headers: azureHeaders });
-    if (!changesRes.ok) {
-      console.error("(log) Failed to fetch changes:", changesRes.status);
-      return;
-    }
-    const changesData = await changesRes.json();
-    const entries = changesData.changeEntries || changesData.changes || [];
-
-    // 2b. Fetch linked work items (product backlog)
-    const workItems = await fetchLinkedWorkItems(project, repoId, prId, azureHeaders);
-    console.log(`(log) Linked work items: ${workItems.length}`);
-    const backlogContext = buildBacklogContext(workItems);
-    if (backlogContext) {
-      console.log(`(log) Backlog context size: ${backlogContext.length} chars`);
+    if (newContent === null) {
+      console.log("(log) Skipping (could not fetch):", f.path);
+      continue;
     }
 
-    // 3. For each changed file, compute diff
-    const fileChanges = [];
-    let totalChangedLines = 0;
-
-    for (const c of entries) {
-      const path = c.item?.path;
-      const changeType = c.changeType;
-      const changeTrackingId = c.changeTrackingId;
-
-      if (!path || path.endsWith("/")) continue;
-
-      const ct = typeof changeType === "string" ? changeType.toLowerCase() : changeType;
-      const isEdit = ct === "edit" || ct === 2;
-      const isAdd = ct === "add" || ct === 1;
-      if (!isEdit && !isAdd) continue;
-
-      console.log(`(log) Processing file (${changeType}): ${path}`);
-
-      const [oldContent, newContent] = await Promise.all([
-        isEdit ? fetchFileAtCommit(project, repoId, path, targetCommit, azureHeaders) : Promise.resolve(null),
-        fetchFileAtCommit(project, repoId, path, sourceCommit, azureHeaders),
-      ]);
-
-      if (newContent === null) {
-        console.log("(log) Skipping (could not fetch):", path);
-        continue;
-      }
-
-      let diff, changedLines;
-      if (isEdit) {
-        const result = computeDiff(oldContent, newContent);
-        diff = result.diff;
-        changedLines = result.changedLines;
-      } else {
-        const lines = newContent.split("\n").slice(0, 80);
-        diff = lines.map((l, idx) => `+${idx + 1}: ${l}`).join("\n");
-        changedLines = lines.map((_, idx) => idx + 1);
-      }
-
-      if (diff) {
-        totalChangedLines += changedLines.length;
-        console.log(`(log) ${path}: changed lines [${changedLines.slice(0, 15).join(",")}...]`);
-        fileChanges.push({
-          path,
-          changeTrackingId,
-          isAdd,
-          diff: diff.substring(0, MAX_FILE_DIFF),
-          changedLines,
-        });
-      }
-    }
-
-    if (fileChanges.length === 0) {
-      console.log("(log) No reviewable changes found");
-      return;
-    }
-
-    // 4. Build prompt with the diff hunks
-    let diffBlock = "";
-    for (const fc of fileChanges) {
-      const header = `\n### FILE: ${fc.path} (${fc.isAdd ? "new file" : "edited"})`;
-      const section = `${header}\n\`\`\`\n${fc.diff}\n\`\`\`\n`;
-      if (diffBlock.length + section.length > MAX_DIFF_SIZE) {
-        console.log("(log) Diff budget reached, skipping remaining files");
-        break;
-      }
-      diffBlock += section;
-    }
-
-    const fileList = fileChanges.map((fc) => fc.path).join(", ");
-    console.log(`(log) Files to review: ${fileList}`);
-    console.log(`(log) Diff size for AI: ${diffBlock.length} chars`);
-
-    // 4a. Compute risk score
-    const riskScore = calculateRisk(fileChanges, totalChangedLines);
-    const risk = riskLevel(riskScore);
-    console.log(`(log) Risk score: ${riskScore}/100 (${risk})`);
-
-    // 4b. Compute largest file changes (top 3 by diff length)
-    const largestFiles = [...fileChanges]
-      .sort((a, b) => b.diff.length - a.diff.length)
-      .slice(0, 3)
-      .map((fc) => fc.path);
-    console.log(`(log) Largest changes: ${largestFiles.join(", ")}`);
-
-    // 4c. AI PR summary (only for large PRs)
-    let prSummary = null;
-    if (diffBlock.length > 5000) {
-      console.log("(log) Large PR detected, generating AI summary...");
-      const summaryAiResponse = await env.AI.run(CF_AI_MODEL, {
-        messages: [
-          { role: "system", content: "You summarize pull requests." },
-          {
-            role: "user",
-            content: `Explain this pull request in 3 concise bullet points.\n\nPR title: ${prTitle}\n\nChanges:\n${diffBlock.substring(0, 4000)}`,
-          },
-        ],
-        max_tokens: 200,
-      });
-      prSummary = summaryAiResponse?.response || null;
-      if (prSummary) {
-        console.log("(log) PR summary generated");
-      }
+    let diff, changedLines;
+    if (f.isEdit) {
+      const result = computeDiff(oldContent, newContent);
+      diff = result.diff;
+      changedLines = result.changedLines;
     } else {
-      console.log("(log) Small PR, skipping AI summary");
+      const lines = newContent.split("\n").slice(0, 80);
+      diff = lines.map((l, idx) => `+${idx + 1}: ${l}`).join("\n");
+      changedLines = lines.map((_, idx) => idx + 1);
     }
 
-    const systemPrompt = `You are a senior code reviewer. Review ONLY the changed lines in the PR diff below.
+    if (diff) {
+      totalChangedLines += changedLines.length;
+      fileChanges.push({
+        path: f.path,
+        changeTrackingId: f.changeTrackingId,
+        isAdd: f.isAdd,
+        diff: diff.substring(0, MAX_FILE_DIFF),
+        changedLines,
+      });
+    }
+  }
+
+  return { fileChanges, totalChangedLines };
+}
+
+// ─── Batch Helper: Call AI for a batch of file changes ──────────────────────
+
+function buildDiffBlock(fileChanges) {
+  let diffBlock = "";
+  for (const fc of fileChanges) {
+    const header = `\n### FILE: ${fc.path} (${fc.isAdd ? "new file" : "edited"})`;
+    const section = `${header}\n\`\`\`\n${fc.diff}\n\`\`\`\n`;
+    if (diffBlock.length + section.length > MAX_DIFF_SIZE) {
+      console.log("(log) Diff budget reached, skipping remaining files in this batch");
+      break;
+    }
+    diffBlock += section;
+  }
+  return diffBlock;
+}
+
+async function aiReviewBatch(fileChanges, prTitle, backlogContext, env) {
+  const diffBlock = buildDiffBlock(fileChanges);
+  const fileList = fileChanges.map((fc) => fc.path).join(", ");
+
+  console.log(`(log) AI batch review: ${fileChanges.length} files, ${diffBlock.length} chars`);
+
+  const systemPrompt = `You are a senior code reviewer. Review ONLY the changed lines in the PR diff below.
 ${backlogContext ? "\nYou will also receive linked product backlog items (user stories, tasks, bugs). Use them to:\n- Understand the INTENT behind the changes and validate the code aligns with the requirements.\n- Check if the code changes are actually RELEVANT to the linked work items. If the work item describes a completely different feature or task than what the code changes implement, flag this mismatch.\n" : ""}
 OUTPUT FORMAT — respond with ONLY a raw JSON array, no markdown, no code fences:
 [{"file":"/path/to/file.cs","line":42,"comment":"Your feedback"}]
@@ -456,161 +523,492 @@ RULES:
 10. If the changed code looks correct, return: [{"file":"/path","line":1,"comment":"LGTM"}]
 11. Do NOT flag syntax errors like missing braces, unmatched if/else, or try/catch structure — the diff shows partial code and the IDE already catches these${backlogContext ? "\n12. If the code contradicts or clearly misses a requirement from the linked work items, flag it\n13. If the linked work items describe a DIFFERENT feature/task than what the code actually does, add a comment on the first changed line: \"⚠️ Backlog mismatch: the linked work item is about [X] but this code changes [Y]. Verify the correct work item is linked to this PR.\"" : ""}`;
 
-    const userPrompt = `PR: "${prTitle}"
+  const userPrompt = `PR: "${prTitle}"
 Files changed: ${fileList}
 ${backlogContext}
 ${diffBlock}`;
 
-    // 5. Call Cloudflare Workers AI
-    console.log("(log) Calling AI...");
-    const aiResponse = await env.AI.run(CF_AI_MODEL, {
-      messages: [
-        { role: "system", content: systemPrompt },
-        { role: "user", content: userPrompt },
-      ],
-      max_tokens: 1024,
-    });
+  const aiResponse = await env.AI.run(CF_AI_MODEL, {
+    messages: [
+      { role: "system", content: systemPrompt },
+      { role: "user", content: userPrompt },
+    ],
+    max_tokens: 1024,
+  });
 
-    // Workers AI may return a parsed object or a string depending on the model
-    const rawResponse = aiResponse?.response;
-    const rawReview = typeof rawResponse === "string"
-      ? rawResponse
-      : JSON.stringify(rawResponse, null, 2);
-    console.log("(log) AI response:", rawReview);
+  const rawResponse = aiResponse?.response;
+  const rawReview = typeof rawResponse === "string"
+    ? rawResponse
+    : JSON.stringify(rawResponse, null, 2);
+  console.log("(log) AI batch response:", rawReview?.substring(0, 200));
 
-    // 6. Parse response
+  // Parse AI response into comments array
+  try {
     let comments;
-    try {
-      if (Array.isArray(rawResponse)) {
-        comments = rawResponse;
-      } else if (typeof rawResponse === "string") {
-        const jsonMatch = rawResponse.match(/\[[\s\S]*?\]/);
-        comments = jsonMatch ? JSON.parse(jsonMatch[0]) : [];
-      } else {
-        comments = [];
-      }
-      if (!Array.isArray(comments)) comments = [];
-      // Deduplicate: keep only the first comment per file+line
-      if (comments.length > 0) {
-        const seen = new Set();
-        comments = comments.filter((c) => {
-          const key = `${c.file}:${c.line}`;
-          if (seen.has(key)) return false;
-          seen.add(key);
-          return true;
-        });
-      }
-    } catch (e) {
-      console.error("(log) JSON parse failed:", e.message);
-      comments = null;
-    }
-
-    const threadBaseUrl = `${ORG}/${project}/_apis/git/repositories/${repoId}/pullRequests/${prId}/threads?api-version=${AZURE_API_VERSION}`;
-
-    // 7. Build a single PR-level summary comment
-    const summary = [`## 🤖 AI Code Review`, ``];
-
-    // PR Summary (only for large PRs)
-    if (prSummary) {
-      summary.push(`### 📋 PR Summary`, ``, prSummary, ``);
-    }
-
-    // Risk Analysis
-    summary.push(
-      `### ⚠ Risk Analysis`,
-      ``,
-      `Score: **${riskScore}/100**`,
-      `Level: **${risk}**`,
-      ``,
-      `Files reviewed: ${fileChanges.length}`,
-      ``
-    );
-
-    // Largest Changes
-    if (largestFiles.length > 0) {
-      summary.push(`### Largest Changes`, ``);
-      for (const f of largestFiles) {
-        const fileName = f.split("/").pop();
-        summary.push(`* ${fileName}`);
-      }
-      summary.push(``);
-    }
-
-    // Linked Work Items
-    if (workItems.length > 0) {
-      summary.push(`### 📋 Linked Work Items`, ``);
-      for (const wi of workItems) {
-        summary.push(`* **${wi.type} #${wi.id}:** ${wi.title} (${wi.state})`);
-        if (wi.parent) {
-          summary.push(`  * ↳ Parent: **${wi.parent.type} #${wi.parent.id}:** ${wi.parent.title}`);
-        }
-      }
-      summary.push(``);
-    }
-
-    if (comments && comments.length > 0) {
-      const byFile = {};
-      for (const c of comments) {
-        if (!c.file || !c.comment) continue;
-        if (!byFile[c.file]) byFile[c.file] = [];
-        byFile[c.file].push(c);
-      }
-
-      let hasIssues = false;
-      for (const fc of fileChanges) {
-        const fileComments = byFile[fc.path] || [];
-        const fileName = fc.path.split("/").pop();
-        const isLgtm = fileComments.length > 0 && fileComments.every((c) => c.comment?.toLowerCase().includes("lgtm"));
-
-        if (fileComments.length === 0 || isLgtm) {
-          summary.push(`### ✅ \`${fileName}\``, `No issues found.`, ``);
-        } else {
-          hasIssues = true;
-          summary.push(`### 📝 \`${fileName}\``);
-          for (const c of fileComments) {
-            if (c.comment?.toLowerCase().includes("lgtm")) continue;
-            const line = parseInt(c.line, 10);
-            summary.push(`- **Line ${line}:** ${c.comment}`);
-          }
-          summary.push(``);
-        }
-      }
-
-      if (!hasIssues) {
-        summary.push(`---`, `✅ **All changes look good!**`);
-      }
-    } else if (comments === null) {
-      summary.push(`### Review`, ``, rawReview || "No review content returned.");
+    if (Array.isArray(rawResponse)) {
+      comments = rawResponse;
+    } else if (typeof rawResponse === "string") {
+      const jsonMatch = rawResponse.match(/\[[\s\S]*?\]/);
+      comments = jsonMatch ? JSON.parse(jsonMatch[0]) : [];
     } else {
-      summary.push(`✅ **No issues found.** Code looks good!`);
+      comments = [];
+    }
+    if (!Array.isArray(comments)) comments = [];
+    // Deduplicate: keep only the first comment per file+line
+    if (comments.length > 0) {
+      const seen = new Set();
+      comments = comments.filter((c) => {
+        const key = `${c.file}:${c.line}`;
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+      });
+    }
+    return comments;
+  } catch (e) {
+    console.error("(log) AI JSON parse failed for batch:", e.message);
+    return [];
+  }
+}
+
+// ─── Batch Helper: Self-call to continue processing ─────────────────────────
+
+async function selfCall(batchPayload, requestUrl) {
+  console.log(`(log) Self-calling for batch #${batchPayload.batchNumber}, ${batchPayload.remainingFiles.length} files remaining`);
+
+  const res = await fetch(requestUrl, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(batchPayload),
+  });
+
+  if (!res.ok) {
+    console.error(`(log) Self-call failed: ${res.status}`);
+    return false;
+  }
+  console.log(`(log) Self-call accepted for batch #${batchPayload.batchNumber}`);
+  return true;
+}
+
+// ─── Unified Review Posting ─────────────────────────────────────────────────
+
+async function postUnifiedReview({
+  project, repoId, prId, prTitle,
+  allFileChanges, allComments, workItems,
+  totalFiles, skippedFiles, batchCount,
+  azureHeaders, env, backlogContext,
+}) {
+  // Risk analysis across all reviewed files
+  const totalChangedLines = allFileChanges.reduce((sum, fc) => sum + fc.changedLines.length, 0);
+  const riskScore = calculateRisk(allFileChanges, totalChangedLines);
+  const risk = riskLevel(riskScore);
+  console.log(`(log) Final risk score: ${riskScore}/100 (${risk})`);
+
+  // Largest file changes (top 3)
+  const largestFiles = [...allFileChanges]
+    .sort((a, b) => b.diff.length - a.diff.length)
+    .slice(0, 3)
+    .map((fc) => fc.path);
+
+  // AI PR summary (only for large PRs)
+  let prSummary = null;
+  const totalDiffSize = allFileChanges.reduce((sum, fc) => sum + fc.diff.length, 0);
+  if (totalDiffSize > 5000) {
+    console.log("(log) Large PR detected, generating AI summary...");
+    try {
+      const summaryDiff = buildDiffBlock(allFileChanges).substring(0, 4000);
+      const summaryAiResponse = await env.AI.run(CF_AI_MODEL, {
+        messages: [
+          { role: "system", content: "You summarize pull requests." },
+          {
+            role: "user",
+            content: `Explain this pull request in 3 concise bullet points.\n\nPR title: ${prTitle}\n\nChanges:\n${summaryDiff}`,
+          },
+        ],
+        max_tokens: 200,
+      });
+      prSummary = summaryAiResponse?.response || null;
+    } catch (e) {
+      console.error("(log) Summary generation failed:", e.message);
+    }
+  }
+
+  // Build summary
+  const summary = [`## 🤖 AI Code Review`, ``];
+
+  // Batch info
+  summary.push(
+    `📊 **Reviewed ${allFileChanges.length} of ${totalFiles} files** (${skippedFiles} skipped as non-reviewable)`,
+    batchCount > 1 ? `🔄 Processed in **${batchCount} batches**` : ``,
+    ``
+  );
+
+  if (prSummary) {
+    summary.push(`### 📋 PR Summary`, ``, prSummary, ``);
+  }
+
+  summary.push(
+    `### ⚠ Risk Analysis`,
+    ``,
+    `Score: **${riskScore}/100**`,
+    `Level: **${risk}**`,
+    ``
+  );
+
+  if (largestFiles.length > 0) {
+    summary.push(`### Largest Changes`, ``);
+    for (const f of largestFiles) {
+      const fileName = f.split("/").pop();
+      summary.push(`* ${fileName}`);
+    }
+    summary.push(``);
+  }
+
+  if (workItems.length > 0) {
+    summary.push(`### 📋 Linked Work Items`, ``);
+    for (const wi of workItems) {
+      summary.push(`* **${wi.type} #${wi.id}:** ${wi.title} (${wi.state})`);
+      if (wi.parent) {
+        summary.push(`  * ↳ Parent: **${wi.parent.type} #${wi.parent.id}:** ${wi.parent.title}`);
+      }
+    }
+    summary.push(``);
+  }
+
+  // Per-file results from all batches
+  if (allComments.length > 0) {
+    const byFile = {};
+    for (const c of allComments) {
+      if (!c.file || !c.comment) continue;
+      if (!byFile[c.file]) byFile[c.file] = [];
+      byFile[c.file].push(c);
     }
 
-    // 8. Post the summary
-    const summaryBody = {
-      comments: [
-        {
-          parentCommentId: 0,
-          content: summary.join("\n"),
-          commentType: 1,
-        },
-      ],
-      status: 4,
+    let hasIssues = false;
+    for (const fc of allFileChanges) {
+      const fileComments = byFile[fc.path] || [];
+      const fileName = fc.path.split("/").pop();
+      const isLgtm = fileComments.length > 0 && fileComments.every((c) => c.comment?.toLowerCase().includes("lgtm"));
+
+      if (fileComments.length === 0 || isLgtm) {
+        summary.push(`### ✅ \`${fileName}\``, `No issues found.`, ``);
+      } else {
+        hasIssues = true;
+        summary.push(`### 📝 \`${fileName}\``);
+        for (const c of fileComments) {
+          if (c.comment?.toLowerCase().includes("lgtm")) continue;
+          const line = parseInt(c.line, 10);
+          summary.push(`- **Line ${line}:** ${c.comment}`);
+        }
+        summary.push(``);
+      }
+    }
+
+    if (!hasIssues) {
+      summary.push(`---`, `✅ **All changes look good!**`);
+    }
+  } else {
+    summary.push(`✅ **No issues found.** Code looks good!`);
+  }
+
+  // Post the review
+  const threadBaseUrl = `${ORG}/${project}/_apis/git/repositories/${repoId}/pullRequests/${prId}/threads?api-version=${AZURE_API_VERSION}`;
+  const summaryBody = {
+    comments: [
+      {
+        parentCommentId: 0,
+        content: summary.join("\n"),
+        commentType: 1,
+      },
+    ],
+    status: 4,
+  };
+
+  const summaryRes = await fetch(threadBaseUrl, {
+    method: "POST",
+    headers: { ...azureHeaders, "Content-Type": "application/json" },
+    body: JSON.stringify(summaryBody),
+  });
+
+  if (summaryRes.ok) {
+    console.log("(log) ✓ Unified review posted");
+  } else {
+    console.error("(log) ✗ Post failed:", summaryRes.status, await summaryRes.text());
+  }
+}
+
+// ─── Main Review Logic (Batch 0) ────────────────────────────────────────────
+
+async function processReview(payload, env, request) {
+  try {
+    const prId = payload.resource.pullRequestId;
+    const repoId = payload.resource.repository.id;
+    const project = payload.resource.repository.project.name;
+    const prTitle = payload.resource.title || "";
+    const sourceCommit = payload.resource.lastMergeSourceCommit.commitId;
+    const targetCommit = payload.resource.lastMergeTargetCommit.commitId;
+    const requestUrl = request.url;
+
+    console.log(`(log) Processing PR ${prId}: "${prTitle}"`);
+    console.log(`(log) Source: ${sourceCommit} | Target: ${targetCommit}`);
+
+    const azureHeaders = {
+      Authorization: `Basic ${btoa(":" + env.AZURE_TOKEN)}`,
     };
 
-    const summaryRes = await fetch(threadBaseUrl, {
-      method: "POST",
-      headers: { ...azureHeaders, "Content-Type": "application/json" },
-      body: JSON.stringify(summaryBody),
-    });
+    // 1. Get latest iteration (1 subrequest)
+    const iterUrl = `${ORG}/${project}/_apis/git/repositories/${repoId}/pullRequests/${prId}/iterations?api-version=${AZURE_API_VERSION}`;
+    const iterRes = await fetch(iterUrl, { headers: azureHeaders });
+    if (!iterRes.ok) {
+      console.error("(log) Failed to fetch iterations:", iterRes.status);
+      return;
+    }
+    const iterData = await iterRes.json();
+    const latestIteration = Math.max(...iterData.value.map((i) => i.id));
 
-    if (summaryRes.ok) {
-      console.log("(log) ✓ Review posted");
-    } else {
-      console.error("(log) ✗ Post failed:", summaryRes.status, await summaryRes.text());
+    // 2. Get changed files (1 subrequest)
+    const changesUrl = `${ORG}/${project}/_apis/git/repositories/${repoId}/pullRequests/${prId}/iterations/${latestIteration}/changes?api-version=${AZURE_API_VERSION}`;
+    const changesRes = await fetch(changesUrl, { headers: azureHeaders });
+    if (!changesRes.ok) {
+      console.error("(log) Failed to fetch changes:", changesRes.status);
+      return;
+    }
+    const changesData = await changesRes.json();
+    const entries = changesData.changeEntries || changesData.changes || [];
+
+    // 3. Fetch linked work items (~3 subrequests)
+    const workItems = await fetchLinkedWorkItems(project, repoId, prId, azureHeaders);
+    console.log(`(log) Linked work items: ${workItems.length}`);
+    const backlogContext = buildBacklogContext(workItems);
+
+    // 4. Classify all files (zero subrequests!)
+    const classified = classifyFiles(entries);
+    console.log(`(log) Classification: ${classified.high.length} HIGH, ${classified.low.length} LOW, ${classified.skip.length} SKIP`);
+
+    // Reviewable = HIGH first, then LOW
+    const reviewableFiles = [...classified.high, ...classified.low];
+    const totalFiles = classified.high.length + classified.low.length + classified.skip.length;
+    const skippedFiles = classified.skip.length;
+
+    if (reviewableFiles.length === 0) {
+      console.log("(log) No reviewable files found after classification");
+      return;
     }
 
-    console.log(`(log) Done! PR ${prId}`);
+    // 5. Take first batch (MAX_BATCH_FILES files)
+    const batchFiles = reviewableFiles.slice(0, MAX_BATCH_FILES);
+    const remainingFiles = reviewableFiles.slice(MAX_BATCH_FILES);
+
+    console.log(`(log) Batch 0: processing ${batchFiles.length} files, ${remainingFiles.length} remaining`);
+
+    // 6. Fetch content + compute diffs (2 subrequests per file = ~40)
+    const { fileChanges } = await fetchAndDiffFiles(
+      batchFiles, project, repoId, sourceCommit, targetCommit, azureHeaders
+    );
+
+    // 7. AI review for this batch (1 subrequest)
+    const batchComments = await aiReviewBatch(fileChanges, prTitle, backlogContext, env);
+
+    // 8. If remaining files → self-call to continue; else post final review
+    if (remainingFiles.length > 0) {
+      const batchPayload = {
+        __isBatchContinuation: true,
+        pr: { id: prId, repoId, project, title: prTitle, sourceCommit, targetCommit },
+        backlogContext,
+        workItems,
+        remainingFiles,
+        accumulatedResults: { fileChanges, comments: batchComments },
+        batchNumber: 1,
+        totalFiles,
+        skippedFiles,
+        requestUrl,
+        azureToken: env.AZURE_TOKEN,
+      };
+
+      const success = await selfCall(batchPayload, requestUrl);
+      if (!success) {
+        // Self-call failed — retry once
+        console.log("(log) Retrying self-call...");
+        const retrySuccess = await selfCall(batchPayload, requestUrl);
+        if (!retrySuccess) {
+          // Post partial review with what we have
+          console.log("(log) Self-call retry failed, posting partial review");
+          await postUnifiedReview({
+            project, repoId, prId, prTitle,
+            allFileChanges: fileChanges,
+            allComments: batchComments,
+            workItems,
+            totalFiles,
+            skippedFiles: skippedFiles + remainingFiles.length,
+            batchCount: 1,
+            azureHeaders, env, backlogContext,
+          });
+        }
+      }
+    } else {
+      // Single batch — post final review directly
+      await postUnifiedReview({
+        project, repoId, prId, prTitle,
+        allFileChanges: fileChanges,
+        allComments: batchComments,
+        workItems,
+        totalFiles,
+        skippedFiles,
+        batchCount: 1,
+        azureHeaders, env, backlogContext,
+      });
+    }
+
+    console.log(`(log) Batch 0 done for PR ${prId}`);
   } catch (err) {
-    console.error("(log) Error:", err.stack || err);
+    console.error("(log) Error in processReview:", err.stack || err);
+  }
+}
+
+// ─── Batch N Processing ─────────────────────────────────────────────────────
+
+async function processBatch(payload, env, request) {
+  try {
+    const {
+      pr, backlogContext, workItems, remainingFiles,
+      accumulatedResults, batchNumber, totalFiles, skippedFiles,
+      requestUrl, azureToken,
+    } = payload;
+
+    // Safety: prevent infinite loops
+    if (batchNumber > MAX_BATCHES) {
+      console.error(`(log) Exceeded MAX_BATCHES (${MAX_BATCHES}), posting partial review`);
+      const azureHeaders = { Authorization: `Basic ${btoa(":" + azureToken)}` };
+      await postUnifiedReview({
+        project: pr.project, repoId: pr.repoId, prId: pr.id, prTitle: pr.title,
+        allFileChanges: accumulatedResults.fileChanges,
+        allComments: accumulatedResults.comments,
+        workItems: workItems || [],
+        totalFiles,
+        skippedFiles: skippedFiles + remainingFiles.length,
+        batchCount: batchNumber,
+        azureHeaders, env, backlogContext,
+      });
+      return;
+    }
+
+    // Safety: verify remaining files is decreasing
+    if (remainingFiles.length === 0) {
+      console.log("(log) No remaining files, posting final review");
+      const azureHeaders = { Authorization: `Basic ${btoa(":" + azureToken)}` };
+      await postUnifiedReview({
+        project: pr.project, repoId: pr.repoId, prId: pr.id, prTitle: pr.title,
+        allFileChanges: accumulatedResults.fileChanges,
+        allComments: accumulatedResults.comments,
+        workItems: workItems || [],
+        totalFiles,
+        skippedFiles,
+        batchCount: batchNumber,
+        azureHeaders, env, backlogContext,
+      });
+      return;
+    }
+
+    const azureHeaders = { Authorization: `Basic ${btoa(":" + azureToken)}` };
+
+    // Batch N can take 22 files (no overhead subrequests needed)
+    const BATCH_N_SIZE = MAX_BATCH_FILES + 2;
+    const batchFiles = remainingFiles.slice(0, BATCH_N_SIZE);
+    const nextRemaining = remainingFiles.slice(BATCH_N_SIZE);
+
+    console.log(`(log) Batch ${batchNumber}: processing ${batchFiles.length} files, ${nextRemaining.length} remaining`);
+
+    // Fetch content + compute diffs (2 subrequests per file)
+    const { fileChanges } = await fetchAndDiffFiles(
+      batchFiles, pr.project, pr.repoId, pr.sourceCommit, pr.targetCommit, azureHeaders
+    );
+
+    // AI review for this batch (1 subrequest)
+    let batchComments = [];
+    try {
+      batchComments = await aiReviewBatch(fileChanges, pr.title, backlogContext, env);
+    } catch (e) {
+      console.error(`(log) AI failed for batch ${batchNumber}:`, e.message);
+      // Mark files as not reviewed but continue chain
+      for (const fc of fileChanges) {
+        batchComments.push({ file: fc.path, line: 1, comment: "⚠️ Could not review this file (AI error in batch)" });
+      }
+    }
+
+    // Merge results
+    const mergedResults = {
+      fileChanges: [...accumulatedResults.fileChanges, ...fileChanges],
+      comments: [...accumulatedResults.comments, ...batchComments],
+    };
+
+    if (nextRemaining.length > 0) {
+      // More files to process — self-call
+      const nextPayload = {
+        __isBatchContinuation: true,
+        pr,
+        backlogContext,
+        workItems,
+        remainingFiles: nextRemaining,
+        accumulatedResults: mergedResults,
+        batchNumber: batchNumber + 1,
+        totalFiles,
+        skippedFiles,
+        requestUrl,
+        azureToken,
+      };
+
+      const success = await selfCall(nextPayload, requestUrl);
+      if (!success) {
+        console.log("(log) Self-call failed, retrying...");
+        const retrySuccess = await selfCall(nextPayload, requestUrl);
+        if (!retrySuccess) {
+          console.log("(log) Retry failed, posting partial review");
+          await postUnifiedReview({
+            project: pr.project, repoId: pr.repoId, prId: pr.id, prTitle: pr.title,
+            allFileChanges: mergedResults.fileChanges,
+            allComments: mergedResults.comments,
+            workItems: workItems || [],
+            totalFiles,
+            skippedFiles: skippedFiles + nextRemaining.length,
+            batchCount: batchNumber + 1,
+            azureHeaders, env, backlogContext,
+          });
+        }
+      }
+    } else {
+      // Last batch — post unified review
+      console.log(`(log) Final batch ${batchNumber}, posting unified review`);
+      await postUnifiedReview({
+        project: pr.project, repoId: pr.repoId, prId: pr.id, prTitle: pr.title,
+        allFileChanges: mergedResults.fileChanges,
+        allComments: mergedResults.comments,
+        workItems: workItems || [],
+        totalFiles,
+        skippedFiles,
+        batchCount: batchNumber + 1,
+        azureHeaders, env, backlogContext,
+      });
+    }
+
+    console.log(`(log) Batch ${batchNumber} done for PR ${pr.id}`);
+  } catch (err) {
+    console.error(`(log) Error in processBatch #${payload.batchNumber}:`, err.stack || err);
+    // Try to post partial review with what we have
+    try {
+      const azureHeaders = { Authorization: `Basic ${btoa(":" + payload.azureToken)}` };
+      await postUnifiedReview({
+        project: payload.pr.project, repoId: payload.pr.repoId,
+        prId: payload.pr.id, prTitle: payload.pr.title,
+        allFileChanges: payload.accumulatedResults.fileChanges,
+        allComments: payload.accumulatedResults.comments,
+        workItems: payload.workItems || [],
+        totalFiles: payload.totalFiles,
+        skippedFiles: payload.skippedFiles + payload.remainingFiles.length,
+        batchCount: payload.batchNumber,
+        azureHeaders, env, backlogContext: payload.backlogContext,
+      });
+    } catch (postErr) {
+      console.error("(log) Could not post partial review:", postErr.message);
+    }
   }
 }

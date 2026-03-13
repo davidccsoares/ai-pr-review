@@ -6,7 +6,8 @@
       "WebFetch(domain:developers.cloudflare.com)",
       "Bash(npx wrangler:*)",
       "Bash(git add:*)",
-      "Bash(npx vitest:*)"
+      "Bash(npx vitest:*)",
+      "Bash(cd \"C:\\\\Users\\\\david\\\\ai-pr-review\" && node -c src/worker.js)"
     ]
   }
 }
