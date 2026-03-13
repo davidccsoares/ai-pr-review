@@ -716,6 +716,7 @@ async function fetchAndDiffFiles(files, project, repoId, sourceCommit, targetCom
 
   let fileDiffsData = [];
   try {
+    console.log(`(log) Calling filediffs API: base=${targetCommit} target=${sourceCommit} for ${files.length} files`);
     const fileDiffsRes = await fetch(fileDiffsUrl, {
       method: "POST",
       headers: { ...azureHeaders, "Content-Type": "application/json" },
@@ -730,6 +731,16 @@ async function fetchAndDiffFiles(files, project, repoId, sourceCommit, targetCom
       const data = await fileDiffsRes.json();
       fileDiffsData = data.value || data || [];
       console.log(`(log) File diffs API returned data for ${fileDiffsData.length} files`);
+      // Debug: log the raw diff blocks
+      for (const fd of fileDiffsData) {
+        const blocks = fd.lineDiffBlocks || [];
+        const nonZero = blocks.filter(b => b.changeType !== 0);
+        console.log(`(log) File diffs for "${fd.path}": ${blocks.length} total blocks, ${nonZero.length} changed blocks`);
+        for (const b of nonZero.slice(0, 10)) {
+          console.log(`(log)   block: changeType=${b.changeType} origStart=${b.originalLineNumberStart} origCount=${b.originalLinesCount} modStart=${b.modifiedLineNumberStart} modCount=${b.modifiedLinesCount}`);
+        }
+        if (nonZero.length > 10) console.log(`(log)   ... and ${nonZero.length - 10} more changed blocks`);
+      }
     } else {
       console.error(`(log) File diffs API failed: ${fileDiffsRes.status}`);
     }
