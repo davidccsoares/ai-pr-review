@@ -671,6 +671,28 @@ function riskLevel(score) {
 
 // ─── Main Review Logic ──────────────────────────────────────────────────────
 
+// ─── Batch Helper: Truncate diff at hunk boundary ──────────────────────────
+
+/**
+ * Truncate a diff string at a clean hunk boundary (at a "---" separator)
+ * instead of cutting mid-line, which confuses the AI.
+ */
+function truncateDiffAtHunkBoundary(diff, maxLen) {
+  if (diff.length <= maxLen) return diff;
+
+  // Find the last "---" hunk separator before the limit
+  const truncated = diff.substring(0, maxLen);
+  const lastHunkEnd = truncated.lastIndexOf("\n---\n");
+
+  if (lastHunkEnd > 0) {
+    return truncated.substring(0, lastHunkEnd + 4); // include the "---\n"
+  }
+
+  // No clean boundary found — find last newline at least
+  const lastNewline = truncated.lastIndexOf("\n");
+  return lastNewline > 0 ? truncated.substring(0, lastNewline) : truncated;
+}
+
 // ─── Batch Helper: Fetch + Diff a batch of files ────────────────────────────
 
 async function fetchAndDiffFiles(files, project, repoId, sourceCommit, targetCommit, azureHeaders) {
@@ -703,11 +725,12 @@ async function fetchAndDiffFiles(files, project, repoId, sourceCommit, targetCom
 
     if (diff) {
       totalChangedLines += changedLines.length;
+      console.log(`(log) ${f.path}: changed lines [${changedLines.slice(0, 10).join(",")}${changedLines.length > 10 ? "..." : ""}] (${changedLines.length} total)`);
       fileChanges.push({
         path: f.path,
         changeTrackingId: f.changeTrackingId,
         isAdd: f.isAdd,
-        diff: diff.substring(0, MAX_FILE_DIFF),
+        diff: truncateDiffAtHunkBoundary(diff, MAX_FILE_DIFF),
         changedLines,
       });
     }
@@ -736,6 +759,11 @@ async function aiReviewBatch(fileChanges, prTitle, backlogContext, env) {
   const diffBlock = buildDiffBlock(fileChanges);
   const fileList = fileChanges.map((fc) => fc.path).join(", ");
 
+  // Build an explicit list of changed lines per file for the AI
+  const changedLinesSummary = fileChanges.map((fc) =>
+    `${fc.path}: lines ${fc.changedLines.join(", ")}`
+  ).join("\n");
+
   console.log(`(log) AI batch review: ${fileChanges.length} files, ${diffBlock.length} chars`);
 
   const systemPrompt = `You are a senior code reviewer. Review ONLY the changed lines in the PR diff below.
@@ -747,14 +775,17 @@ RULES:
 1. ONLY comment on lines prefixed with "+" (these are the changed/added lines)
 2. NEVER comment on context lines (prefixed with a space) or removed lines (prefixed with "-")
 3. "file" must exactly match the file path from the diff header
-4. "line" must be the exact line number shown after the "+" prefix
+4. "line" must be the exact line number shown after the "+" prefix — ONLY use line numbers from the CHANGED LINES list below
 5. NEVER repeat the same line number — one comment per line, max
 6. Keep each comment concise (1-2 sentences)
 7. Focus on: actual bugs, null reference risks, security vulnerabilities, clear logic errors
 8. Do NOT guess or speculate — only flag issues you are certain about
 9. Do NOT comment on code style, naming, or formatting
-10. If the changed code looks correct, return: [{"file":"/path","line":1,"comment":"LGTM"}]
-11. Do NOT flag syntax errors like missing braces, unmatched if/else, or try/catch structure — the diff shows partial code and the IDE already catches these${backlogContext ? "\n12. If the code contradicts or clearly misses a requirement from the linked work items, flag it\n13. If the linked work items describe a DIFFERENT feature/task than what the code actually does, add a comment on the first changed line: \"⚠️ Backlog mismatch: the linked work item is about [X] but this code changes [Y]. Verify the correct work item is linked to this PR.\"" : ""}`;
+10. If the changed code looks correct, return: [{"file":"/path","line":1,"comment":"LGTM"}] where "line" is the first changed line number
+11. Do NOT flag syntax errors like missing braces, unmatched if/else, or try/catch structure — the diff shows partial code and the IDE already catches these${backlogContext ? "\n12. If the code contradicts or clearly misses a requirement from the linked work items, flag it\n13. If the linked work items describe a DIFFERENT feature/task than what the code actually does, add a comment on the first changed line: \"⚠️ Backlog mismatch: the linked work item is about [X] but this code changes [Y]. Verify the correct work item is linked to this PR.\"" : ""}
+
+IMPORTANT: The ONLY valid line numbers you may use in your response are listed below. Any other line number is WRONG:
+${changedLinesSummary}`;
 
   const userPrompt = `PR: "${prTitle}"
 Files changed: ${fileList}
@@ -796,6 +827,29 @@ ${diffBlock}`;
         seen.add(key);
         return true;
       });
+    }
+    // Validate: reject comments on lines that aren't actually changed
+    const validLinesByFile = new Map();
+    for (const fc of fileChanges) {
+      validLinesByFile.set(fc.path, new Set(fc.changedLines));
+    }
+    const beforeCount = comments.length;
+    comments = comments.filter((c) => {
+      if (!c.file || !c.line) return false;
+      const validLines = validLinesByFile.get(c.file);
+      if (!validLines) {
+        console.log(`(log) Rejected comment: file "${c.file}" not in batch`);
+        return false;
+      }
+      const lineNum = parseInt(c.line, 10);
+      if (!validLines.has(lineNum)) {
+        console.log(`(log) Rejected comment: line ${lineNum} not a changed line in "${c.file}" (valid: ${[...validLines].slice(0, 5).join(",")}...)`);
+        return false;
+      }
+      return true;
+    });
+    if (beforeCount !== comments.length) {
+      console.log(`(log) Filtered ${beforeCount - comments.length} invalid comments (wrong line numbers)`);
     }
     return comments;
   } catch (e) {
