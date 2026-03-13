@@ -1,5 +1,6 @@
 const ORG = "https://dev.azure.com/bindtuning";
 const AZURE_API_VERSION = "7.0";
+const AZURE_API_VERSION_FILEDIFFS = "7.1";
 const MAX_DIFF_SIZE = 60000;
 const MAX_FILE_DIFF = 3000;
 const MAX_BACKLOG_SIZE = 3000;
@@ -695,44 +696,146 @@ function truncateDiffAtHunkBoundary(diff, maxLen) {
 
 // ─── Batch Helper: Fetch + Diff a batch of files ────────────────────────────
 
+/**
+ * Use Azure DevOps File Diffs API to get exact changed line ranges,
+ * then fetch the new file content and extract only the changed hunks.
+ * This replaces our custom diff algorithm with Azure's server-side diff.
+ *
+ * Subrequests per batch:
+ *  - 1 POST to filediffs API (returns line ranges for ALL files in the batch)
+ *  - 1 GET per file to fetch new content
+ *  = 1 + N subrequests (down from 2N with the old approach)
+ */
 async function fetchAndDiffFiles(files, project, repoId, sourceCommit, targetCommit, azureHeaders) {
   const fileChanges = [];
   let totalChangedLines = 0;
 
+  // 1. Get line-level diffs from Azure for all files in the batch (1 subrequest!)
+  const fileDiffParams = files.map((f) => ({ path: f.path, originalPath: f.path }));
+  const fileDiffsUrl = `${ORG}/${project}/_apis/git/repositories/${repoId}/filediffs?api-version=${AZURE_API_VERSION_FILEDIFFS}`;
+
+  let fileDiffsData = [];
+  try {
+    const fileDiffsRes = await fetch(fileDiffsUrl, {
+      method: "POST",
+      headers: { ...azureHeaders, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        baseVersionCommit: targetCommit,
+        targetVersionCommit: sourceCommit,
+        fileDiffParams,
+      }),
+    });
+
+    if (fileDiffsRes.ok) {
+      const data = await fileDiffsRes.json();
+      fileDiffsData = data.value || data || [];
+      console.log(`(log) File diffs API returned data for ${fileDiffsData.length} files`);
+    } else {
+      console.error(`(log) File diffs API failed: ${fileDiffsRes.status}`);
+    }
+  } catch (e) {
+    console.error("(log) File diffs API error:", e.message);
+  }
+
+  // Build a map of path → lineDiffBlocks
+  const diffBlocksByPath = new Map();
+  for (const fd of fileDiffsData) {
+    const p = fd.path || fd.originalPath;
+    if (p && fd.lineDiffBlocks) {
+      diffBlocksByPath.set(p, fd.lineDiffBlocks);
+    }
+  }
+
+  // 2. For each file, fetch new content and build diff using Azure's line ranges
   for (const f of files) {
     console.log(`(log) Processing file (${f.isAdd ? "add" : "edit"}): ${f.path}`);
 
-    const [oldContent, newContent] = await Promise.all([
-      f.isEdit ? fetchFileAtCommit(project, repoId, f.path, targetCommit, azureHeaders) : Promise.resolve(null),
-      fetchFileAtCommit(project, repoId, f.path, sourceCommit, azureHeaders),
-    ]);
+    const newContent = await fetchFileAtCommit(project, repoId, f.path, sourceCommit, azureHeaders);
 
     if (newContent === null) {
       console.log("(log) Skipping (could not fetch):", f.path);
       continue;
     }
 
-    let diff, changedLines;
-    if (f.isEdit) {
-      const result = computeDiff(oldContent, newContent);
-      diff = result.diff;
-      changedLines = result.changedLines;
-    } else {
-      const lines = newContent.split("\n").slice(0, 80);
-      diff = lines.map((l, idx) => `+${idx + 1}: ${l}`).join("\n");
-      changedLines = lines.map((_, idx) => idx + 1);
+    const newLines = newContent.split("\n");
+
+    if (f.isAdd) {
+      // New file — show first 80 lines
+      const lines = newLines.slice(0, 80);
+      const diff = lines.map((l, idx) => `+${idx + 1}: ${l}`).join("\n");
+      const changedLines = lines.map((_, idx) => idx + 1);
+      totalChangedLines += changedLines.length;
+      fileChanges.push({
+        path: f.path,
+        changeTrackingId: f.changeTrackingId,
+        isAdd: true,
+        diff: truncateDiffAtHunkBoundary(diff, MAX_FILE_DIFF),
+        changedLines,
+      });
+      continue;
     }
 
-    if (diff) {
+    // Edited file — use Azure's lineDiffBlocks
+    const blocks = diffBlocksByPath.get(f.path);
+    if (!blocks || blocks.length === 0) {
+      console.log(`(log) No diff blocks from Azure for ${f.path}, skipping`);
+      continue;
+    }
+
+    // Build hunks from Azure's lineDiffBlocks
+    // changeType: 0=None, 1=Add, 2=Delete, 3=Edit (we want 1 and 3 for new lines)
+    const output = [];
+    const changedLines = [];
+
+    for (const block of blocks) {
+      if (block.changeType === 0) continue; // no change
+
+      const modStart = block.modifiedLineNumberStart; // 1-based
+      const modCount = block.modifiedLinesCount;
+
+      // Context: show a few lines before and after the changed range
+      const ctxBefore = Math.max(0, modStart - 1 - CONTEXT_LINES);
+      const ctxAfter = Math.min(newLines.length, modStart - 1 + modCount + CONTEXT_LINES);
+
+      output.push(`@@ line ${modStart} @@`);
+
+      for (let i = ctxBefore; i < ctxAfter; i++) {
+        const lineNum = i + 1; // 1-based
+        const isChanged = lineNum >= modStart && lineNum < modStart + modCount;
+
+        if (isChanged) {
+          if (block.changeType === 2) {
+            // Pure delete — line exists in old file, not in new
+            output.push(`-${lineNum}: (deleted)`);
+          } else {
+            // Add or Edit — line exists in new file
+            if (i < newLines.length) {
+              output.push(`+${lineNum}: ${newLines[i]}`);
+              changedLines.push(lineNum);
+            }
+          }
+        } else {
+          if (i < newLines.length) {
+            output.push(` ${lineNum}: ${newLines[i]}`);
+          }
+        }
+      }
+      output.push("---");
+    }
+
+    if (changedLines.length > 0) {
+      const diff = output.join("\n");
       totalChangedLines += changedLines.length;
       console.log(`(log) ${f.path}: changed lines [${changedLines.slice(0, 10).join(",")}${changedLines.length > 10 ? "..." : ""}] (${changedLines.length} total)`);
       fileChanges.push({
         path: f.path,
         changeTrackingId: f.changeTrackingId,
-        isAdd: f.isAdd,
+        isAdd: false,
         diff: truncateDiffAtHunkBoundary(diff, MAX_FILE_DIFF),
         changedLines,
       });
+    } else {
+      console.log(`(log) ${f.path}: no modified lines found in diff blocks`);
     }
   }
 
