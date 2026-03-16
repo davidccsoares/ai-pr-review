@@ -9,7 +9,11 @@ const PLAYWRIGHT_PROJECT = "BindTuning";
 const PLAYWRIGHT_TEST_BRANCH = "internship/playwright-unit-tests";
 const PIPELINE_ID = 88;
 const MAX_MD_CHARS = 24000;
-const MAX_DIFF_SIZE = 50000;
+// Cloudflare free plan: 50 subrequests per invocation.
+// /test endpoint worst case: ~38 subrequests (repo + PR + iterations + changes + 15 file contents + test gen flow).
+// POST endpoint worst case: ~19 subrequests (3 docs + 7 existing checks + AI + push flow + pipeline + comment).
+// Keep file limits conservative to stay under the cap.
+const MAX_COMPONENT_FILES = 10;  // Max changed files to analyze (was 15 — reduced for subrequest safety)
 
 // The specific documentation files to fetch from the test branch
 const MD_DOC_PATHS = [
@@ -136,28 +140,30 @@ async function handleTest(env, ctx, dryRun = false) {
       const changesData = await changesRes.json();
       const entries = changesData.changeEntries || changesData.changes || [];
 
-      // Build simplified file changes (fetch new file content for diffs)
-      const fileChanges = [];
-      for (const e of entries) {
-        if (!e.item?.path || e.item.path.endsWith("/")) continue;
+      // Build simplified file changes (fetch new file content for diffs — in parallel)
+      const eligibleEntries = entries.filter(e => {
+        if (!e.item?.path || e.item.path.endsWith("/")) return false;
         const ct = typeof e.changeType === "string" ? e.changeType.toLowerCase() : e.changeType;
-        const isEdit = ct === "edit" || ct === 2;
-        const isAdd = ct === "add" || ct === 1;
-        if (!isEdit && !isAdd) continue;
+        return ct === "edit" || ct === 2 || ct === "add" || ct === 1;
+      }).slice(0, MAX_COMPONENT_FILES);
 
-        // Fetch the new file content
-        const fileUrl = `${ORG}/${PLAYWRIGHT_PROJECT}/_apis/git/repositories/${repoId}/items?path=${encodeURIComponent(e.item.path)}&versionDescriptor.version=${sourceCommit}&versionDescriptor.versionType=commit&includeContent=true&api-version=${AZURE_API_VERSION}`;
-        const fileRes = await fetch(fileUrl, { headers: azureHeaders });
-        if (!fileRes.ok) continue;
-        const content = await fileRes.text();
+      const fileResults = await Promise.allSettled(
+        eligibleEntries.map(async (e) => {
+          const ct = typeof e.changeType === "string" ? e.changeType.toLowerCase() : e.changeType;
+          const isAdd = ct === "add" || ct === 1;
+          const fileUrl = `${ORG}/${PLAYWRIGHT_PROJECT}/_apis/git/repositories/${repoId}/items?path=${encodeURIComponent(e.item.path)}&versionDescriptor.version=${sourceCommit}&versionDescriptor.versionType=commit&includeContent=true&api-version=${AZURE_API_VERSION}`;
+          const fileRes = await fetch(fileUrl, { headers: azureHeaders });
+          if (!fileRes.ok) return null;
+          const content = await fileRes.text();
+          const lines = content.split("\n").slice(0, 80);
+          const diff = lines.map((l, idx) => `+${idx + 1}: ${l}`).join("\n");
+          return { path: e.item.path, diff, isAdd };
+        })
+      );
 
-        const lines = content.split("\n").slice(0, 80);
-        const diff = lines.map((l, idx) => `+${idx + 1}: ${l}`).join("\n");
-
-        fileChanges.push({ path: e.item.path, diff, isAdd });
-
-        if (fileChanges.length >= 15) break; // Limit to conserve subrequests
-      }
+      const fileChanges = fileResults
+        .filter(r => r.status === "fulfilled" && r.value !== null)
+        .map(r => r.value);
 
       const testPayload = {
         prId,
@@ -255,12 +261,12 @@ async function runTestGeneration(payload, env) {
     }
     console.log(`(log) [Playwright] Found ${componentFiles.length} component files`);
 
-    // 2. Fetch .md documentation from the test branch
-    const mdDocs = await fetchMdDocs(project, repoId, azureHeaders);
+    // 2. Fetch docs and existing test files in parallel (independent operations)
+    const [mdDocs, existingFiles] = await Promise.all([
+      fetchMdDocs(project, repoId, azureHeaders),
+      fetchExistingTestFiles(project, repoId, componentFiles, azureHeaders),
+    ]);
     console.log(`(log) [Playwright] Fetched ${mdDocs.length} .md documentation files`);
-
-    // 2b. Fetch existing test infrastructure from the test branch (actionsFixture + existing Actions/spec files)
-    const existingFiles = await fetchExistingTestFiles(project, repoId, componentFiles, azureHeaders);
     console.log(`(log) [Playwright] Found ${existingFiles.length} existing test file(s) on the test branch`);
 
     // 3. Call AI to generate actual test files
@@ -278,8 +284,10 @@ async function runTestGeneration(payload, env) {
     // ── Dry run: log results and stop ──
     if (dryRun) {
       console.log("(log) [Playwright] DRY RUN — skipping push, pipeline, and PR comment");
+      const existingSpecPaths = new Set(existingFiles.map(ef => ef.path.replace(/^\//, "").toLowerCase()));
       for (const t of generatedTests) {
-        console.log(`(log) [Playwright] [DRY RUN] Would create: ${t.filePath} (${t.content.length} chars)`);
+        const action = existingSpecPaths.has(t.filePath.toLowerCase()) ? "update" : "create";
+        console.log(`(log) [Playwright] [DRY RUN] Would ${action}: ${t.filePath} (${t.content.length} chars)`);
         console.log(`(log) [Playwright] [DRY RUN] Preview:\n${t.content.substring(0, 500)}`);
       }
       console.log(`(log) [Playwright] DRY RUN complete for PR #${prId}`);
@@ -339,37 +347,32 @@ function identifyComponentFiles(fileChanges) {
 // ─── Step 2: Fetch .md Documentation from Test Branch ────────────────────────
 
 /**
- * Fetch the specific documentation files (REPOSITORY_CONTEXT.md, PULSE_REFERENCE.md)
- * from the internship/playwright-unit-tests branch.
- *
- * Subrequests: 1 per file = 2 total
+ * Fetch documentation files from the test branch (parallelized).
+ * Subrequests: 1 per file = 3 total (run concurrently).
  */
 async function fetchMdDocs(project, repoId, azureHeaders) {
-  const mdDocs = [];
-
   console.log(`(log) [Playwright] Fetching ${MD_DOC_PATHS.length} doc files from branch: ${PLAYWRIGHT_TEST_BRANCH}`);
 
-  for (const docPath of MD_DOC_PATHS) {
-    try {
+  const results = await Promise.allSettled(
+    MD_DOC_PATHS.map(async (docPath) => {
       const contentUrl = `${ORG}/${project}/_apis/git/repositories/${repoId}/items?path=${encodeURIComponent(docPath)}&versionDescriptor.version=${encodeURIComponent(PLAYWRIGHT_TEST_BRANCH)}&versionDescriptor.versionType=branch&includeContent=true&api-version=${AZURE_API_VERSION}`;
       const contentRes = await fetch(contentUrl, { headers: azureHeaders });
-
-      if (contentRes.ok) {
-        let content = await contentRes.text();
-        if (content.length > MAX_MD_CHARS) {
-          content = content.substring(0, MAX_MD_CHARS) + "\n...(truncated)";
-        }
-        mdDocs.push({ path: docPath, content });
-        console.log(`(log) [Playwright] Fetched: ${docPath} (${content.length} chars)`);
-      } else {
+      if (!contentRes.ok) {
         console.log(`(log) [Playwright] Could not fetch ${docPath}: ${contentRes.status}`);
+        return null;
       }
-    } catch (e) {
-      console.error(`(log) [Playwright] Error fetching ${docPath}:`, e.message);
-    }
-  }
+      let content = await contentRes.text();
+      if (content.length > MAX_MD_CHARS) {
+        content = content.substring(0, MAX_MD_CHARS) + "\n...(truncated)";
+      }
+      console.log(`(log) [Playwright] Fetched: ${docPath} (${content.length} chars)`);
+      return { path: docPath, content };
+    })
+  );
 
-  return mdDocs;
+  return results
+    .filter(r => r.status === "fulfilled" && r.value !== null)
+    .map(r => r.value);
 }
 
 // ─── Step 2b: Fetch Existing Test Files from Test Branch ─────────────────────
@@ -382,39 +385,36 @@ async function fetchMdDocs(project, repoId, azureHeaders) {
  * Returns an array of { path, content } for files that exist.
  */
 async function fetchExistingTestFiles(project, repoId, componentFiles, azureHeaders) {
-  const existing = [];
-
   // Paths to check: always fetch actionsFixture.ts
   const pathsToCheck = ["/tests/fixtures/actionsFixture.ts"];
 
   // For each component stem, check if Actions and spec files already exist
   const stems = [...new Set(componentFiles.map(f => f.stem))];
   for (const stem of stems) {
-    // Try common locations based on repo structure
     pathsToCheck.push(`/tests/components/${stem}/${stem}Actions.ts`);
     pathsToCheck.push(`/tests/components/${stem}/${stem}.spec.ts`);
   }
 
-  for (const filePath of pathsToCheck) {
-    try {
+  const results = await Promise.allSettled(
+    pathsToCheck.map(async (filePath) => {
       const contentUrl = `${ORG}/${project}/_apis/git/repositories/${repoId}/items?path=${encodeURIComponent(filePath)}&versionDescriptor.version=${encodeURIComponent(PLAYWRIGHT_TEST_BRANCH)}&versionDescriptor.versionType=branch&includeContent=true&api-version=${AZURE_API_VERSION}`;
       const contentRes = await fetch(contentUrl, { headers: azureHeaders });
+      if (!contentRes.ok) return null;
+      const fullContent = await contentRes.text();
 
-      if (contentRes.ok) {
-        let content = await contentRes.text();
-        // Truncate large files to conserve prompt space — we only need the structure
-        if (content.length > 4000) {
-          content = content.substring(0, 4000) + "\n...(truncated)";
-        }
-        existing.push({ path: filePath, content });
-        console.log(`(log) [Playwright] Existing file found: ${filePath} (${content.length} chars)`);
+      // For the AI prompt, truncate to save tokens — but keep full content for merge operations
+      let promptContent = fullContent;
+      if (promptContent.length > 4000) {
+        promptContent = promptContent.substring(0, 4000) + "\n...(truncated)";
       }
-    } catch (e) {
-      // Silently skip — file doesn't exist, which is fine
-    }
-  }
+      console.log(`(log) [Playwright] Existing file found: ${filePath} (${fullContent.length} chars)`);
+      return { path: filePath, content: promptContent, fullContent };
+    })
+  );
 
-  return existing;
+  return results
+    .filter(r => r.status === "fulfilled" && r.value !== null)
+    .map(r => r.value);
 }
 
 // ─── Step 3: AI Test Generation ──────────────────────────────────────────────
@@ -435,13 +435,25 @@ async function generateTests(componentFiles, mdDocs, existingFiles, prTitle, env
     }
   }
 
-  // Build existing test files context
+  // Build existing test files context — send compact summaries to save tokens
   let existingContext = "";
   if (existingFiles.length > 0) {
     existingContext = "\n## Existing Test Files (already on the test branch)\n\n";
     existingContext += "These files ALREADY EXIST. Do NOT regenerate them. Reuse their classes and imports.\n\n";
     for (const ef of existingFiles) {
-      existingContext += `### ${ef.path}\n\`\`\`typescript\n${ef.content}\n\`\`\`\n\n`;
+      const source = ef.fullContent || ef.content;
+      if (ef.path.includes("actionsFixture")) {
+        // For the fixture, just show the type signature (what actions are available)
+        existingContext += `### ${ef.path}\nThis fixture provides these action objects: ${extractFixtureActions(source).join(", ")}\n\n`;
+      } else if (/Actions\.ts$/i.test(ef.path)) {
+        // For Actions files, extract method signatures instead of sending full source
+        const methods = extractMethodSignatures(source);
+        existingContext += `### ${ef.path}\nClass with these methods:\n${methods.map(m => "- " + m).join("\n")}\n\n`;
+      } else {
+        // For spec files, show test names so the AI knows what already exists
+        const testNames = extractTestNames(source);
+        existingContext += `### ${ef.path}\nExisting tests:\n${testNames.map(n => "- " + n).join("\n")}\n\n`;
+      }
     }
   }
 
@@ -534,17 +546,28 @@ Settings: WORKSPACE_GENERAL, PROFILE_ACCOUNT
 Intranet: THEMES, WEBPARTS
 
 ─── OUTPUT FORMAT ───────────────────────────────────────────────────────────
-Respond with ONLY a raw JSON array, no markdown, no code fences:
-[{"filePath": "tests/components/feature/feature.spec.ts", "content": "import { test, expect } from '../../fixtures/actionsFixture';\\n..."}]
-If you also generate an Actions file, include it as a separate entry:
-[{"filePath": "tests/components/feature/featureActions.ts", "content": "..."}, {"filePath": "tests/components/feature/feature.spec.ts", "content": "..."}]
+Respond with ONLY a raw JSON array, no markdown, no code fences.
+
+If the spec file DOES NOT exist yet, return a complete file:
+[{"filePath": "tests/components/feature/feature.spec.ts", "content": "import { test, expect } from '../../fixtures/actionsFixture';\\n...full file..."}]
+
+If the spec file ALREADY EXISTS (shown in "Existing Test Files"), return ONLY the new test() blocks
+to be appended inside the existing describe block. Do NOT include imports, do NOT include test.describe,
+do NOT include test.beforeEach — just the raw test() calls:
+[{"filePath": "tests/components/feature/feature.spec.ts", "appendOnly": true, "content": "  test('should do new thing @Tag', async ({ actions }) => {\\n    ...\\n  });\\n\\n  test('should do other new thing @Tag', async ({ actions }) => {\\n    ...\\n  });"}]
+
+If you also generate a NEW Actions file, include it as a separate entry:
+[{"filePath": "tests/components/feature/featureActions.ts", "content": "..."}, {"filePath": "...spec.ts", ...}]
+
+If the spec already exists AND the PR changes don't warrant new tests, return an empty array: []
 
 ─── RULES ───────────────────────────────────────────────────────────────────
 1. Generate one spec file per logical component/feature changed.
 2. Check the "Existing Test Files" section FIRST:
    - If the Actions class is already in actionsFixture.ts, use \`actions.<name>\` — do NOT regenerate the Actions file.
    - If the Actions file exists but is NOT in the fixture, import it directly and instantiate with \`new\`.
-   - If the spec file already exists, only generate NEW tests that cover the PR diff — do NOT duplicate existing tests.
+   - If the spec file already exists, set "appendOnly": true and return ONLY new test() blocks — no imports, no describe, no beforeEach.
+   - If the spec exists and the PR changes are already covered by existing tests, return an empty array [].
    - Only generate a new Actions file when none exists for the feature.
 3. Each test file must be a valid, runnable Playwright test using the actionsFixture.
 4. Include meaningful test descriptions that explain what is being tested.
@@ -580,13 +603,37 @@ ${filesDescription}`;
     const rawStr = typeof raw === "string" ? raw.trim() : JSON.stringify(raw);
     console.log("(log) [Playwright] AI response length:", rawStr?.length ?? 0);
 
-    // Parse the JSON array
+    // Parse the JSON array from the AI response
     let tests;
     if (Array.isArray(raw)) {
       tests = raw;
     } else if (typeof raw === "string") {
-      const jsonMatch = raw.match(/\[[\s\S]*\]/);
-      tests = jsonMatch ? JSON.parse(jsonMatch[0]) : null;
+      // Strip markdown code fences if present (```json ... ```)
+      let cleaned = raw.trim();
+      cleaned = cleaned.replace(/^```(?:json)?\s*\n?/i, "").replace(/\n?```\s*$/, "");
+
+      const jsonMatch = cleaned.match(/\[[\s\S]*\]/);
+      if (jsonMatch) {
+        const jsonStr = jsonMatch[0];
+
+        // Try parsing as-is first (works if AI returned well-formed JSON)
+        try {
+          tests = JSON.parse(jsonStr);
+        } catch (_e1) {
+          // If direct parse fails, sanitize control characters INSIDE string values only.
+          // Walk through the JSON and only escape newlines/tabs that are inside quoted strings.
+          try {
+            const sanitized = sanitizeJsonStringValues(jsonStr);
+            tests = JSON.parse(sanitized);
+          } catch (e2) {
+            console.error("(log) [Playwright] JSON parse failed after sanitization:", e2.message);
+            console.log("(log) [Playwright] Raw AI response (first 500 chars):", rawStr?.substring(0, 500));
+            tests = null;
+          }
+        }
+      } else {
+        tests = null;
+      }
     } else {
       tests = null;
     }
@@ -605,7 +652,9 @@ ${filesDescription}`;
     const fixtureFile = existingFiles.find(ef => ef.path.includes("actionsFixture"));
     const registeredActions = new Set();
     if (fixtureFile) {
-      const actionMatches = fixtureFile.content.matchAll(/(\w+):\s*new\s+\w+Actions\(page\)/g);
+      // Use fullContent (not truncated) so we can find all registered actions
+      const fixtureSource = fixtureFile.fullContent || fixtureFile.content;
+      const actionMatches = fixtureSource.matchAll(/(\w+):\s*new\s+\w+Actions\(page\)/g);
       for (const m of actionMatches) {
         registeredActions.add(m[1].toLowerCase());
       }
@@ -615,6 +664,7 @@ ${filesDescription}`;
     // Validate each test has required fields and post-process common AI mistakes
     return tests.filter(t => t.filePath && t.content).map(t => {
       let filePath = t.filePath.replace(/^\//, ""); // strip leading slash
+      const isAppendOnly = !!t.appendOnly;
 
       // Ensure spec files live under tests/components/ (fix flat paths like "tests/dashboard.spec.ts")
       if (filePath.match(/^tests\/[^/]+\.spec\.ts$/) && !filePath.startsWith("tests/components/")) {
@@ -622,8 +672,59 @@ ${filesDescription}`;
         filePath = `tests/components/${name}/${name}.spec.ts`;
       }
 
-      // Fix wrong import: replace '@playwright/test' test import with actionsFixture
       let content = t.content;
+
+      // ── Handle existing spec files: merge new tests into existing content ──
+      const existingSpec = existingFiles.find(
+        ef => ef.path.replace(/^\//, "").toLowerCase() === filePath.toLowerCase()
+      );
+      if (existingSpec && filePath.endsWith(".spec.ts")) {
+        // Use the FULL content for merge — not the truncated version sent to the AI
+        const existingFull = existingSpec.fullContent || existingSpec.content;
+
+        if (isAppendOnly) {
+          // AI returned only new test() blocks — inject them before the closing of the last describe
+          console.log(`(log) [Playwright] Appending new tests into existing ${filePath}`);
+          const lastClose = existingFull.lastIndexOf("});");
+          if (lastClose !== -1) {
+            content = existingFull.substring(0, lastClose) + "\n" + content.trim() + "\n\n" + existingFull.substring(lastClose);
+          } else {
+            // Fallback: just append
+            content = existingFull + "\n\n" + content;
+          }
+        } else {
+          // AI ignored appendOnly and returned a full file — extract just the test() blocks
+          // and merge them into the existing file
+          console.log(`(log) [Playwright] AI returned full file for existing spec — extracting new tests only`);
+          const newTestBlocks = extractTestBlocks(content);
+          const existingTestNames = extractTestNames(existingFull);
+          // Filter to only genuinely new tests
+          const uniqueNewTests = newTestBlocks.filter(
+            block => !existingTestNames.some(name => block.includes(name))
+          );
+          if (uniqueNewTests.length === 0) {
+            console.log(`(log) [Playwright] No new tests to add to ${filePath} — all already exist`);
+            content = null; // Mark for removal
+          } else {
+            console.log(`(log) [Playwright] Merging ${uniqueNewTests.length} new test(s) into existing ${filePath}`);
+            const lastClose = existingFull.lastIndexOf("});");
+            if (lastClose !== -1) {
+              content = existingFull.substring(0, lastClose) + "\n" + uniqueNewTests.join("\n\n") + "\n\n" + existingFull.substring(lastClose);
+            } else {
+              content = existingFull + "\n\n" + uniqueNewTests.join("\n\n");
+            }
+          }
+        }
+        // Skip further import/fixture rewrites — we're using the existing file's imports
+        if (content) {
+          return { filePath, content };
+        }
+        return { filePath, content: null };
+      }
+
+      // ── Non-existing spec files: apply standard post-processing ──
+
+      // Fix wrong import: replace '@playwright/test' test import with actionsFixture
       content = content.replace(
         /import\s*\{\s*test\s*,\s*expect\s*\}\s*from\s*['"]@playwright\/test['"]/g,
         "import { test, expect } from '../../fixtures/actionsFixture'"
@@ -636,21 +737,16 @@ ${filesDescription}`;
       // If the spec manually instantiates an Actions class that is already in the fixture,
       // rewrite to use the fixture's `actions.<name>` instead
       if (filePath.endsWith(".spec.ts") && registeredActions.size > 0) {
-        // Detect patterns like: new DashboardActions(page) or let dashboardActions = new DashboardActions(page)
         const manualInstMatch = content.match(/new\s+(\w+)Actions\(page\)/);
         if (manualInstMatch) {
-          const className = manualInstMatch[1]; // e.g., "Dashboard"
-          const fixtureKey = className.charAt(0).toLowerCase() + className.slice(1); // e.g., "dashboard"
+          const className = manualInstMatch[1];
+          const fixtureKey = className.charAt(0).toLowerCase() + className.slice(1);
           if (registeredActions.has(fixtureKey.toLowerCase())) {
             console.log(`(log) [Playwright] Post-fix: ${className}Actions is in fixture as actions.${fixtureKey} — rewriting spec to use fixture`);
-
-            // Remove the manual import of the Actions class
             content = content.replace(
               new RegExp(`import\\s*\\{\\s*${className}Actions\\s*\\}\\s*from\\s*['"][^'"]+['"];?\\n?`, "g"),
               ""
             );
-
-            // Remove manual instantiation lines (let/const varName = new XActions(page))
             const varName = fixtureKey + "Actions";
             content = content.replace(
               new RegExp(`\\s*(let|const)\\s+${varName}\\s*[:=][^;]*;?\\n?`, "gi"),
@@ -660,15 +756,10 @@ ${filesDescription}`;
               new RegExp(`\\s*${varName}\\s*=\\s*new\\s+${className}Actions\\(page\\);?\\n?`, "gi"),
               "\n"
             );
-
-            // Replace usages: dashboardActions.method() -> actions.dashboard.method()
-            // Also handle: await dashboardActions. -> await actions.dashboard.
             content = content.replace(
               new RegExp(`${varName}\\.`, "g"),
               `actions.${fixtureKey}.`
             );
-
-            // Ensure test callbacks destructure { actions } if they only had { page } or {}
             content = content.replace(
               /async\s*\(\{\s*\}\)/g,
               "async ({ actions })"
@@ -683,6 +774,8 @@ ${filesDescription}`;
 
       return { filePath, content };
     }).filter(t => {
+      // Drop entries with null content (no new tests to add)
+      if (!t.content) return false;
       // Drop Actions files the AI regenerated when they already exist on the test branch
       const isActionsFile = /Actions\.ts$/i.test(t.filePath);
       if (isActionsFile && existingPaths.has(t.filePath.toLowerCase())) {
@@ -695,6 +788,131 @@ ${filesDescription}`;
     console.error("(log) [Playwright] AI test generation failed:", e.message);
     return null;
   }
+}
+
+// ─── Helpers: Extract test blocks and names from spec file content ───────────
+
+/**
+ * Extract method signatures from an Actions class file.
+ * Returns array of strings like "async goToDashboard()" or "async goToTab(tabName: string, buttonName: string)"
+ */
+function extractMethodSignatures(content) {
+  const methods = [];
+  const methodPattern = /async\s+(\w+)\s*\(([^)]*)\)/g;
+  let match;
+  while ((match = methodPattern.exec(content)) !== null) {
+    const name = match[1];
+    const params = match[2].trim();
+    // Skip constructor
+    if (name === "constructor") continue;
+    methods.push(`async ${name}(${params})`);
+  }
+  return methods;
+}
+
+/**
+ * Extract registered action names from the actionsFixture.ts file.
+ * Returns array of strings like "actions.pulse", "actions.dashboard", etc.
+ */
+function extractFixtureActions(content) {
+  const actions = [];
+  const pattern = /(\w+):\s*new\s+\w+Actions\(page\)/g;
+  let match;
+  while ((match = pattern.exec(content)) !== null) {
+    actions.push(`actions.${match[1]}`);
+  }
+  return actions;
+}
+
+/**
+ * Extract individual test() blocks from a spec file string.
+ * Returns an array of strings, each being a complete test(...) block.
+ */
+function extractTestBlocks(content) {
+  const blocks = [];
+  const testPattern = /^[ \t]*test\s*\(/gm;
+  let match;
+  while ((match = testPattern.exec(content)) !== null) {
+    // Find the matching closing brace by counting braces
+    let depth = 0;
+    let started = false;
+    let end = match.index;
+    for (let i = match.index; i < content.length; i++) {
+      if (content[i] === "{") { depth++; started = true; }
+      if (content[i] === "}") { depth--; }
+      if (started && depth === 0) {
+        // Include the closing ");""
+        end = Math.min(i + 3, content.length); // });
+        break;
+      }
+    }
+    blocks.push(content.substring(match.index, end).trim());
+  }
+  return blocks;
+}
+
+/**
+ * Extract test names (the string inside test('...',)) from a spec file.
+ * Returns an array of test name strings.
+ */
+/**
+ * Sanitize control characters (newlines, tabs) ONLY inside JSON string values.
+ * Walks the string character by character, tracking whether we're inside a quoted string.
+ * Structural whitespace (between keys/values) is left untouched.
+ */
+function sanitizeJsonStringValues(jsonStr) {
+  let result = "";
+  let inString = false;
+  let escaped = false;
+
+  for (let i = 0; i < jsonStr.length; i++) {
+    const ch = jsonStr[i];
+
+    if (escaped) {
+      // Previous char was a backslash inside a string — pass through as-is
+      result += ch;
+      escaped = false;
+      continue;
+    }
+
+    if (inString) {
+      if (ch === "\\") {
+        escaped = true;
+        result += ch;
+      } else if (ch === '"') {
+        inString = false;
+        result += ch;
+      } else if (ch === "\n") {
+        result += "\\n";
+      } else if (ch === "\r") {
+        result += "\\r";
+      } else if (ch === "\t") {
+        result += "\\t";
+      } else if (ch.charCodeAt(0) < 0x20) {
+        // Other control characters — strip them
+        continue;
+      } else {
+        result += ch;
+      }
+    } else {
+      if (ch === '"') {
+        inString = true;
+      }
+      result += ch;
+    }
+  }
+
+  return result;
+}
+
+function extractTestNames(content) {
+  const names = [];
+  const namePattern = /test\s*\(\s*['"`]([^'"`]+)['"`]/g;
+  let match;
+  while ((match = namePattern.exec(content)) !== null) {
+    names.push(match[1]);
+  }
+  return names;
 }
 
 // ─── Step 4: Push Tests to Branch ────────────────────────────────────────────
@@ -733,23 +951,26 @@ async function pushTests(project, repoId, generatedTests, prId, azureHeaders) {
     const oldObjectId = branchRef.objectId;
     console.log(`(log) [Playwright] Branch tip: ${oldObjectId}`);
 
-    // 2. Check which files already exist
-    const changes = [];
-    for (const test of generatedTests) {
-      const checkUrl = `${ORG}/${project}/_apis/git/repositories/${repoId}/items?path=${encodeURIComponent("/" + test.filePath)}&versionDescriptor.version=${encodeURIComponent(PLAYWRIGHT_TEST_BRANCH)}&versionDescriptor.versionType=branch&api-version=${AZURE_API_VERSION}`;
-      const checkRes = await fetch(checkUrl, { headers: azureHeaders, method: "HEAD" });
-      const exists = checkRes.ok;
+    // 2. Check which files already exist (in parallel)
+    const existChecks = await Promise.allSettled(
+      generatedTests.map(async (test) => {
+        const checkUrl = `${ORG}/${project}/_apis/git/repositories/${repoId}/items?path=${encodeURIComponent("/" + test.filePath)}&versionDescriptor.version=${encodeURIComponent(PLAYWRIGHT_TEST_BRANCH)}&versionDescriptor.versionType=branch&api-version=${AZURE_API_VERSION}`;
+        const checkRes = await fetch(checkUrl, { headers: azureHeaders, method: "HEAD" });
+        return { test, exists: checkRes.ok };
+      })
+    );
 
-      changes.push({
-        changeType: exists ? "edit" : "add",
-        item: { path: "/" + test.filePath },
-        newContent: {
-          content: test.content,
-          contentType: "rawtext",
-        },
+    const changes = existChecks
+      .filter(r => r.status === "fulfilled")
+      .map(r => {
+        const { test, exists } = r.value;
+        console.log(`(log) [Playwright] File ${test.filePath}: ${exists ? "edit" : "add"}`);
+        return {
+          changeType: exists ? "edit" : "add",
+          item: { path: "/" + test.filePath },
+          newContent: { content: test.content, contentType: "rawtext" },
+        };
       });
-      console.log(`(log) [Playwright] File ${test.filePath}: ${exists ? "edit" : "add"}`);
-    }
 
     // 3. Push all files in a single commit
     const pushUrl = `${ORG}/${project}/_apis/git/repositories/${repoId}/pushes?api-version=${AZURE_API_VERSION}`;
