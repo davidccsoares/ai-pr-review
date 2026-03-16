@@ -9,15 +9,16 @@ const MAX_BATCH_FILES = 20;
 const MAX_BATCHES = 15;
 const CF_AI_MODEL = "@cf/mistralai/mistral-small-3.1-24b-instruct";
 
-// ─── Playwright Test Generation Config ──────────────────────────────────────
+// ─── Playwright Test Generation (delegated to separate worker) ───────────────
 const PLAYWRIGHT_REPO_NAME = "BindTuning.AdminApp";
 const PLAYWRIGHT_TARGET_BRANCH = "refs/heads/Dev";
-const PLAYWRIGHT_TEST_BRANCH = "internship/playwright-unit-tests";
-const PLAYWRIGHT_PIPELINE_ID = 88;
 const PLAYWRIGHT_PROJECT = "BindTuning";
+const PLAYWRIGHT_WORKER_URL = "https://playwright-test-gen.soarespt0.workers.dev";
 
 export default {
   async fetch(request, env, ctx) {
+    const url = new URL(request.url);
+
     if (request.method !== "POST") {
       return new Response("Only POST allowed", { status: 405 });
     }
@@ -1272,11 +1273,10 @@ async function processReview(payload, env, request) {
         azureHeaders, env, backlogContext,
       });
 
-      // Playwright test generation (non-blocking, only for eligible PRs)
+      // Playwright test generation (fire-and-forget to dedicated worker)
       if (isPlaywrightEligible(payload)) {
-        console.log("(log) [Playwright] PR is eligible, launching test generation flow");
-        runPlaywrightFlow({ payload, fileChanges, env, azureHeaders })
-          .catch(e => console.error("(log) [Playwright] Unhandled error:", e.message));
+        console.log("(log) [Playwright] PR is eligible, delegating to playwright-test-gen worker");
+        firePlaywrightWorker({ payload, fileChanges, env });
       }
     }
 
@@ -1411,15 +1411,14 @@ async function processBatch(payload, env, request) {
         azureHeaders, env, backlogContext,
       });
 
-      // Playwright test generation (non-blocking, only for eligible PRs)
+      // Playwright test generation (fire-and-forget to dedicated worker)
       if (originalPayload && isPlaywrightEligible(originalPayload)) {
-        console.log("(log) [Playwright] PR is eligible (final batch), launching test generation flow");
-        runPlaywrightFlow({
+        console.log("(log) [Playwright] PR is eligible (final batch), delegating to playwright-test-gen worker");
+        firePlaywrightWorker({
           payload: originalPayload,
           fileChanges: mergedResults.fileChanges,
           env,
-          azureHeaders,
-        }).catch(e => console.error("(log) [Playwright] Unhandled error:", e.message));
+        });
       }
     }
 
@@ -1446,7 +1445,7 @@ async function processBatch(payload, env, request) {
   }
 }
 
-// ─── Playwright Test Generation & Execution ─────────────────────────────────
+// ─── Playwright Test Generation (delegated to separate worker) ───────────────
 
 /**
  * Check whether the PR webhook targets the AdminApp repo's Dev branch.
@@ -1460,387 +1459,34 @@ function isPlaywrightEligible(payload) {
 }
 
 /**
- * Identify Angular component files from the file changes that are candidates
- * for Playwright test generation.
- * Returns { needTests: [...], existingTests: [...] }
+ * Fire-and-forget: send PR data to the dedicated Playwright test generation
+ * worker. The main worker doesn't await the result — the Playwright worker
+ * runs independently with its own subrequest budget.
  */
-function identifyComponentFiles(fileChanges) {
-  const componentPatterns = /\.(component\.ts|component\.html|service\.ts|guard\.ts|interceptor\.ts|resolver\.ts|directive\.ts|pipe\.ts)$/i;
-  const angularFiles = fileChanges.filter(fc => componentPatterns.test(fc.path));
+function firePlaywrightWorker({ payload, fileChanges, env }) {
+  const prId = payload.resource.pullRequestId;
+  const repoId = payload.resource.repository.id;
+  const project = payload.resource.repository.project.name;
+  const prTitle = payload.resource.title || "";
 
-  const needTests = [];
-  const existingTests = [];
-
-  for (const fc of angularFiles) {
-    // Derive expected test path: e.g. src/app/features/login/login.component.ts
-    // → tests/components/login/login.spec.ts
-    const pathParts = fc.path.split("/");
-    const fileName = pathParts[pathParts.length - 1];
-    // Extract the component/service name stem: "login.component.ts" → "login"
-    const stem = fileName.replace(/\.(component|service|guard|interceptor|resolver|directive|pipe)\.(ts|html)$/i, "");
-    const expectedTestDir = `tests/components/${stem}/`;
-
-    // We cannot check the filesystem from the worker, so we mark all changed
-    // component files as needing tests.  The AI prompt will ask it to check
-    // whether existing tests cover the component and, if so, only suggest
-    // additions rather than new files.
-    needTests.push({
+  const body = {
+    prId,
+    repoId,
+    project,
+    prTitle,
+    fileChanges: fileChanges.map(fc => ({
       path: fc.path,
-      stem,
-      expectedTestDir,
       diff: fc.diff,
       isAdd: fc.isAdd,
-    });
-  }
-
-  return { needTests, existingTests };
-}
-
-/**
- * Call the AI model to generate Playwright test code that follows the
- * existing conventions in the BindTuning.AdminApp test suite.
- *
- * Returns an array of { filePath, content } objects representing test files.
- */
-async function generatePlaywrightTests(componentFiles, prTitle, env) {
-  if (componentFiles.length === 0) return [];
-
-  const filesDescription = componentFiles.map(f =>
-    `### ${f.path} (${f.isAdd ? "new" : "edited"})\n\`\`\`\n${f.diff}\n\`\`\``
-  ).join("\n\n");
-
-  const systemPrompt = `You are an expert Playwright test author for an Angular application.
-You must follow the EXACT conventions of the existing test framework:
-
-## Test Framework Style Guide
-
-### Imports & Fixtures
-- Always import \`test\` from \`../../fixtures/actionsFixture\`
-- Import action classes from the local \`actions/\` folder
-
-### Action Classes (*Actions.ts)
-- Every page/component gets an Actions class that extends \`BaseActions\`
-- Constructor takes \`Page\` from Playwright
-- Methods wrap Playwright locators and actions (click, fill, navigate, assert)
-- Use \`this.page.locator()\`, \`this.page.goto()\`, \`expect()\`
-
-### Spec Files (*.spec.ts)
-- Use \`test.describe('ComponentName', () => { ... })\` grouping
-- Use \`test('should do something', async ({ page, loginActions }) => { ... })\` pattern
-- Use \`@Tag\` annotations for test tagging, e.g. \`test('should render @smoke', ...)\`
-- Use \`ROUTES\` constants for navigation paths (import from \`../../constants/routes\`)
-- Use \`TIMEOUTS\` constants for wait times (import from \`../../constants/timeouts\`)
-- Use \`withBase(ROUTES.SOME_ROUTE)\` helper for full URL construction
-
-### File Structure
-- Place files under \`tests/components/<component-name>/\`
-- Action files: \`tests/components/<component-name>/actions/<ComponentName>Actions.ts\`
-- Spec files: \`tests/components/<component-name>/<component-name>.spec.ts\`
-
-### Testing Patterns
-- Navigation tests: verify page loads, URL is correct
-- Element visibility tests: verify key elements render
-- Interaction tests: click buttons, fill forms, check results
-- Always add appropriate waits using TIMEOUTS constants
-
-OUTPUT FORMAT — respond with ONLY a raw JSON array, no markdown, no code fences:
-[{"filePath":"tests/components/example/example.spec.ts","content":"import { test } from ..."}]
-
-Each object must have:
-- "filePath": the full path for the test file (relative to repo root)
-- "content": the complete TypeScript file content
-
-Generate BOTH an Actions file and a spec file for each component.
-If a component already has tests (matching path pattern), generate ADDITIONAL test cases only.
-Do NOT generate tests for trivial template-only changes (e.g. text changes in HTML).`;
-
-  const userPrompt = `PR: "${prTitle}"
-
-Generate Playwright tests for the following changed Angular component files:
-
-${filesDescription}`;
-
-  try {
-    console.log("(log) [Playwright] Generating tests for", componentFiles.length, "component files");
-
-    const aiResponse = await env.AI.run(CF_AI_MODEL, {
-      messages: [
-        { role: "system", content: systemPrompt },
-        { role: "user", content: userPrompt },
-      ],
-      max_tokens: 2048,
-    });
-
-    const rawResponse = aiResponse?.response;
-    console.log("(log) [Playwright] AI response length:", typeof rawResponse === "string" ? rawResponse.length : "N/A");
-
-    let testFiles;
-    if (Array.isArray(rawResponse)) {
-      testFiles = rawResponse;
-    } else if (typeof rawResponse === "string") {
-      const jsonMatch = rawResponse.match(/\[[\s\S]*\]/);
-      testFiles = jsonMatch ? JSON.parse(jsonMatch[0]) : [];
-    } else {
-      testFiles = [];
-    }
-
-    if (!Array.isArray(testFiles)) testFiles = [];
-
-    // Validate each entry has the required fields
-    testFiles = testFiles.filter(f =>
-      f && typeof f.filePath === "string" && typeof f.content === "string"
-      && f.filePath.length > 0 && f.content.length > 0
-    );
-
-    console.log("(log) [Playwright] Generated", testFiles.length, "test files");
-    return testFiles;
-  } catch (e) {
-    console.error("(log) [Playwright] AI test generation failed:", e.message);
-    return [];
-  }
-}
-
-/**
- * Push generated test files to the internship/playwright-unit-tests branch
- * using the Azure DevOps Git Push API.
- *
- * Returns true on success, false on failure.
- */
-async function pushTestsToAzure(testFiles, project, repoId, azureHeaders) {
-  if (testFiles.length === 0) return false;
-
-  try {
-    // 1. Get the latest commit on the test branch
-    const refsUrl = `${ORG}/${project}/_apis/git/repositories/${repoId}/refs?filter=heads/${PLAYWRIGHT_TEST_BRANCH}&api-version=${AZURE_API_VERSION}`;
-    const refsRes = await fetch(refsUrl, { headers: azureHeaders });
-
-    if (!refsRes.ok) {
-      console.error("(log) [Playwright] Failed to fetch branch ref:", refsRes.status);
-      return false;
-    }
-
-    const refsData = await refsRes.json();
-    const branchRef = (refsData.value || []).find(
-      r => r.name === `refs/heads/${PLAYWRIGHT_TEST_BRANCH}`
-    );
-
-    if (!branchRef) {
-      console.error("(log) [Playwright] Branch not found:", PLAYWRIGHT_TEST_BRANCH);
-      return false;
-    }
-
-    const oldObjectId = branchRef.objectId;
-    console.log("(log) [Playwright] Branch tip:", oldObjectId);
-
-    // 2. Build the push payload — add/edit each test file
-    const changes = testFiles.map(f => ({
-      changeType: "add", // "add" works for both new and edit in Azure DevOps pushes
-      item: { path: "/" + f.filePath.replace(/^\//, "") },
-      newContent: {
-        content: f.content,
-        contentType: "rawtext",
-      },
-    }));
-
-    const pushUrl = `${ORG}/${project}/_apis/git/repositories/${repoId}/pushes?api-version=${AZURE_API_VERSION}`;
-    const pushBody = {
-      refUpdates: [
-        {
-          name: `refs/heads/${PLAYWRIGHT_TEST_BRANCH}`,
-          oldObjectId,
-        },
-      ],
-      commits: [
-        {
-          comment: `[AI Bot] Generated Playwright tests for PR changes`,
-          changes,
-        },
-      ],
-    };
-
-    const pushRes = await fetch(pushUrl, {
-      method: "POST",
-      headers: { ...azureHeaders, "Content-Type": "application/json" },
-      body: JSON.stringify(pushBody),
-    });
-
-    if (pushRes.ok) {
-      console.log("(log) [Playwright] ✓ Pushed", testFiles.length, "test files to", PLAYWRIGHT_TEST_BRANCH);
-      return true;
-    } else {
-      const errText = await pushRes.text();
-      console.error("(log) [Playwright] Push failed:", pushRes.status, errText);
-      return false;
-    }
-  } catch (e) {
-    console.error("(log) [Playwright] Push error:", e.message);
-    return false;
-  }
-}
-
-/**
- * Trigger Playwright pipeline (definition ID 88) to run against the test branch.
- * Returns the pipeline run URL on success, or null on failure.
- */
-async function triggerPlaywrightPipeline(project, azureHeaders) {
-  try {
-    const pipelineUrl = `${ORG}/${project}/_apis/pipelines/${PLAYWRIGHT_PIPELINE_ID}/runs?api-version=${AZURE_API_VERSION}`;
-    const body = {
-      resources: {
-        repositories: {
-          self: {
-            refName: `refs/heads/${PLAYWRIGHT_TEST_BRANCH}`,
-          },
-        },
-      },
-    };
-
-    const res = await fetch(pipelineUrl, {
-      method: "POST",
-      headers: { ...azureHeaders, "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    });
-
-    if (res.ok) {
-      const data = await res.json();
-      const runUrl = data._links?.web?.href || data.url || null;
-      console.log("(log) [Playwright] ✓ Pipeline triggered, run URL:", runUrl);
-      return runUrl;
-    } else {
-      console.error("(log) [Playwright] Pipeline trigger failed:", res.status, await res.text());
-      return null;
-    }
-  } catch (e) {
-    console.error("(log) [Playwright] Pipeline trigger error:", e.message);
-    return null;
-  }
-}
-
-/**
- * Post a summary comment to the PR describing what Playwright tests were
- * generated, pushed, and which pipeline run was triggered.
- */
-async function postPlaywrightSummary({ project, repoId, prId, testFiles, pipelineRunUrl, componentFiles, azureHeaders }) {
-  const summary = [`## 🎭 Playwright Test Generation`, ``];
-
-  if (testFiles.length > 0) {
-    summary.push(`### Generated Test Files`);
-    summary.push(`Pushed **${testFiles.length}** test file(s) to \`${PLAYWRIGHT_TEST_BRANCH}\`:`);
-    summary.push(``);
-    for (const f of testFiles) {
-      summary.push(`- \`${f.filePath}\``);
-    }
-    summary.push(``);
-  } else {
-    summary.push(`No new test files were generated for the changed components.`, ``);
-  }
-
-  if (componentFiles.length > 0) {
-    summary.push(`### Changed Components Analyzed`);
-    for (const f of componentFiles) {
-      summary.push(`- \`${f.path}\` → expected test dir: \`${f.expectedTestDir}\``);
-    }
-    summary.push(``);
-  }
-
-  if (pipelineRunUrl) {
-    summary.push(`### 🚀 Pipeline Run`);
-    summary.push(`Playwright pipeline has been triggered: [View Run](${pipelineRunUrl})`);
-    summary.push(``);
-  } else if (testFiles.length > 0) {
-    summary.push(`### ⚠️ Pipeline`);
-    summary.push(`Could not trigger Playwright pipeline automatically. Please run pipeline **#${PLAYWRIGHT_PIPELINE_ID}** manually on branch \`${PLAYWRIGHT_TEST_BRANCH}\`.`);
-    summary.push(``);
-  }
-
-  summary.push(`---`, `_Generated by AI PR Review Bot — Playwright Module_`);
-
-  const threadUrl = `${ORG}/${project}/_apis/git/repositories/${repoId}/pullRequests/${prId}/threads?api-version=${AZURE_API_VERSION}`;
-  const body = {
-    comments: [
-      {
-        parentCommentId: 0,
-        content: summary.join("\n"),
-        commentType: 1,
-      },
-    ],
-    status: 4,
+    })),
+    azureToken: env.AZURE_TOKEN,
   };
 
-  try {
-    const res = await fetch(threadUrl, {
-      method: "POST",
-      headers: { ...azureHeaders, "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    });
-
-    if (res.ok) {
-      console.log("(log) [Playwright] ✓ Summary comment posted to PR");
-    } else {
-      console.error("(log) [Playwright] Summary post failed:", res.status, await res.text());
-    }
-  } catch (e) {
-    console.error("(log) [Playwright] Summary post error:", e.message);
-  }
-}
-
-/**
- * Orchestrate the full Playwright test generation flow:
- * 1. Identify changed Angular components
- * 2. Generate test suggestions via AI
- * 3. Push generated tests to the test branch
- * 4. Trigger the Playwright pipeline
- * 5. Post a summary comment to the PR
- *
- * This is called non-blocking via ctx.waitUntil() after the main code review.
- */
-async function runPlaywrightFlow({ payload, fileChanges, env, azureHeaders }) {
-  try {
-    const prId = payload.resource.pullRequestId;
-    const repoId = payload.resource.repository.id;
-    const project = payload.resource.repository.project.name;
-    const prTitle = payload.resource.title || "";
-
-    console.log(`(log) [Playwright] Starting flow for PR ${prId}`);
-
-    // 1. Identify Angular component files that changed
-    const { needTests } = identifyComponentFiles(fileChanges);
-
-    if (needTests.length === 0) {
-      console.log("(log) [Playwright] No Angular component files changed, skipping");
-      return;
-    }
-
-    console.log(`(log) [Playwright] Found ${needTests.length} component files needing tests`);
-
-    // 2. Generate Playwright tests via AI
-    const testFiles = await generatePlaywrightTests(needTests, prTitle, env);
-
-    // 3. Push generated tests to the test branch
-    let pushSuccess = false;
-    if (testFiles.length > 0) {
-      pushSuccess = await pushTestsToAzure(testFiles, project, repoId, azureHeaders);
-    }
-
-    // 4. Trigger pipeline (even if no new tests — existing tests may be relevant)
-    let pipelineRunUrl = null;
-    if (pushSuccess) {
-      pipelineRunUrl = await triggerPlaywrightPipeline(project, azureHeaders);
-    }
-
-    // 5. Post summary comment to the PR
-    await postPlaywrightSummary({
-      project,
-      repoId,
-      prId,
-      testFiles: pushSuccess ? testFiles : [],
-      pipelineRunUrl,
-      componentFiles: needTests,
-      azureHeaders,
-    });
-
-    console.log(`(log) [Playwright] Flow completed for PR ${prId}`);
-  } catch (e) {
-    console.error("(log) [Playwright] Flow error:", e.stack || e.message);
-  }
+  fetch(PLAYWRIGHT_WORKER_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  })
+    .then(res => console.log(`(log) [Playwright] Worker responded: ${res.status}`))
+    .catch(e => console.error("(log) [Playwright] Worker call failed:", e.message));
 }

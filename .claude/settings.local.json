@@ -15,7 +15,9 @@
       "WebFetch(domain:github.com)",
       "WebFetch(domain:raw.githubusercontent.com)",
       "Bash(cd \"C:\\\\Users\\\\david\\\\ai-pr-review\" && node -c src/worker.js && npx wrangler deploy)",
-      "Bash(node:*)"
+      "Bash(node:*)",
+      "Bash(curl:*)",
+      "WebFetch(domain:dev.azure.com)"
     ]
   }
 }

@@ -4,7 +4,9 @@
 	"private": true,
 	"scripts": {
 		"deploy": "wrangler deploy",
+		"deploy:playwright": "wrangler deploy -c wrangler-playwright.jsonc",
 		"dev": "wrangler dev",
+		"dev:playwright": "wrangler dev -c wrangler-playwright.jsonc",
 		"start": "wrangler dev",
 		"test": "vitest"
 	},
