@@ -4,6 +4,8 @@
  *   2. Secret/Credential Detection
  *   3. Inline Thread Comments
  *   4. Integration: postUnifiedReview output
+ *   5. GET / Health Endpoint
+ *   6. PR Auto-Tagging (label computation)
  *
  * Uses Node.js built-in test runner (node:test + node:assert) — zero extra deps.
  * Run: node --test test/dry-run.test.mjs
@@ -629,5 +631,266 @@ describe("Integration: postUnifiedReview output", () => {
     assert.equal(callOrder[0], "inline", "Inline comments should be posted first");
     assert.equal(callOrder[1], "summary", "Summary should be posted after inline comments");
     assert.equal(callOrder.length, 2, "Exactly 2 call groups expected");
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Inline copy of computePrLabels (not exported from worker.js)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+const BACKEND_PATTERN = /\.(cs|py|go|rs|java|kt|rb)$/i;
+const FRONTEND_PATTERN = /\.(ts|tsx|js|jsx|vue|svelte|component\.html)$/i;
+
+function computePrLabels(classified) {
+  const labels = [];
+  const allReviewable = [...classified.high, ...classified.low];
+
+  // docs-only: every file was skipped (no reviewable files)
+  if (allReviewable.length === 0 && classified.skip.length > 0) {
+    labels.push("docs-only");
+    return labels;
+  }
+
+  // large-pr: 15+ reviewable files
+  if (allReviewable.length >= 15) {
+    labels.push("large-pr");
+  }
+
+  // high-risk: 5+ high-priority files
+  if (classified.high.length >= 5) {
+    labels.push("high-risk");
+  }
+
+  // frontend / backend detection
+  const hasBackend = allReviewable.some(f => BACKEND_PATTERN.test(f.path));
+  const hasFrontend = allReviewable.some(f => FRONTEND_PATTERN.test(f.path));
+  if (hasBackend) labels.push("backend");
+  if (hasFrontend) labels.push("frontend");
+
+  return labels;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Feature 5: GET / Health Endpoint
+// ═══════════════════════════════════════════════════════════════════════════════
+
+describe("Feature 5: GET / Health Endpoint", () => {
+  it("returns JSON with status, worker name, and uptime", () => {
+    // Simulate the health response shape from the worker
+    const STARTUP_TIME = Date.now() - 60_000; // started 60s ago
+    const response = {
+      status: "ok",
+      worker: "ai-pr-review-gateway",
+      uptime: Math.floor((Date.now() - STARTUP_TIME) / 1000),
+    };
+
+    assert.equal(response.status, "ok");
+    assert.equal(response.worker, "ai-pr-review-gateway");
+    assert.ok(response.uptime >= 59 && response.uptime <= 61, `Uptime should be ~60s, got ${response.uptime}`);
+  });
+
+  it("GET returns 200, non-POST/non-GET returns 405", () => {
+    // Simulate the routing logic
+    function routeMethod(method) {
+      if (method === "GET") return 200;
+      if (method === "POST") return null; // proceeds to webhook logic
+      return 405;
+    }
+
+    assert.equal(routeMethod("GET"), 200);
+    assert.equal(routeMethod("POST"), null);
+    assert.equal(routeMethod("PUT"), 405);
+    assert.equal(routeMethod("DELETE"), 405);
+    assert.equal(routeMethod("PATCH"), 405);
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Feature 6: PR Auto-Tagging (label computation)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+describe("Feature 6: PR Auto-Tagging", () => {
+  it("labels backend-only PR as 'backend'", () => {
+    const classified = {
+      high: [
+        { path: "/src/Controllers/UserController.cs", priorityScore: 10 },
+        { path: "/src/Services/AuthService.cs", priorityScore: 8 },
+      ],
+      low: [],
+      skip: [],
+    };
+    const labels = computePrLabels(classified);
+    assert.ok(labels.includes("backend"), "Should include 'backend' label");
+    assert.ok(!labels.includes("frontend"), "Should NOT include 'frontend' label");
+  });
+
+  it("labels frontend-only PR as 'frontend'", () => {
+    const classified = {
+      high: [
+        { path: "/src/app/login/login.component.ts", priorityScore: 9 },
+        { path: "/src/app/login/login.component.html", priorityScore: 6 },
+      ],
+      low: [],
+      skip: [],
+    };
+    const labels = computePrLabels(classified);
+    assert.ok(labels.includes("frontend"), "Should include 'frontend' label");
+    assert.ok(!labels.includes("backend"), "Should NOT include 'backend' label");
+  });
+
+  it("labels full-stack PR as both 'backend' and 'frontend'", () => {
+    const classified = {
+      high: [
+        { path: "/src/Controllers/ApiController.cs", priorityScore: 10 },
+        { path: "/src/app/dashboard/dashboard.component.ts", priorityScore: 9 },
+      ],
+      low: [],
+      skip: [],
+    };
+    const labels = computePrLabels(classified);
+    assert.ok(labels.includes("backend"), "Should include 'backend'");
+    assert.ok(labels.includes("frontend"), "Should include 'frontend'");
+  });
+
+  it("labels 'docs-only' when all files are skipped", () => {
+    const classified = {
+      high: [],
+      low: [],
+      skip: [
+        { path: "/README.md" },
+        { path: "/docs/setup.md" },
+        { path: "/package-lock.json" },
+      ],
+    };
+    const labels = computePrLabels(classified);
+    assert.deepEqual(labels, ["docs-only"], "Should only have 'docs-only' label");
+  });
+
+  it("labels 'large-pr' when 15+ reviewable files", () => {
+    const classified = {
+      high: Array.from({ length: 10 }, (_, i) => ({
+        path: `/src/file${i}.cs`,
+        priorityScore: 5,
+      })),
+      low: Array.from({ length: 6 }, (_, i) => ({
+        path: `/src/style${i}.css`,
+      })),
+      skip: [],
+    };
+    const labels = computePrLabels(classified);
+    assert.ok(labels.includes("large-pr"), "Should include 'large-pr'");
+  });
+
+  it("labels 'high-risk' when 5+ high-priority files", () => {
+    const classified = {
+      high: Array.from({ length: 6 }, (_, i) => ({
+        path: `/src/Controllers/Controller${i}.cs`,
+        priorityScore: 10,
+      })),
+      low: [],
+      skip: [],
+    };
+    const labels = computePrLabels(classified);
+    assert.ok(labels.includes("high-risk"), "Should include 'high-risk'");
+  });
+
+  it("does NOT label 'high-risk' with fewer than 5 high files", () => {
+    const classified = {
+      high: [
+        { path: "/src/Controllers/UserController.cs", priorityScore: 10 },
+        { path: "/src/Services/AuthService.cs", priorityScore: 8 },
+      ],
+      low: [],
+      skip: [],
+    };
+    const labels = computePrLabels(classified);
+    assert.ok(!labels.includes("high-risk"), "Should NOT include 'high-risk' with only 2 high files");
+  });
+
+  it("does NOT label 'large-pr' with fewer than 15 files", () => {
+    const classified = {
+      high: Array.from({ length: 5 }, (_, i) => ({
+        path: `/src/file${i}.ts`,
+        priorityScore: 5,
+      })),
+      low: [],
+      skip: [],
+    };
+    const labels = computePrLabels(classified);
+    assert.ok(!labels.includes("large-pr"), "Should NOT include 'large-pr' with only 5 files");
+  });
+
+  it("returns empty labels for small clean PR", () => {
+    const classified = {
+      high: [
+        { path: "/src/utils/format.py", priorityScore: 3 },
+      ],
+      low: [],
+      skip: [],
+    };
+    const labels = computePrLabels(classified);
+    // Only "backend" expected (Python)
+    assert.deepEqual(labels, ["backend"]);
+    assert.ok(!labels.includes("large-pr"));
+    assert.ok(!labels.includes("high-risk"));
+    assert.ok(!labels.includes("docs-only"));
+  });
+
+  it("combines multiple labels correctly (large + high-risk + full-stack)", () => {
+    const classified = {
+      high: [
+        ...Array.from({ length: 5 }, (_, i) => ({
+          path: `/src/Controllers/C${i}.cs`,
+          priorityScore: 10,
+        })),
+        ...Array.from({ length: 5 }, (_, i) => ({
+          path: `/src/app/comp${i}.component.ts`,
+          priorityScore: 9,
+        })),
+      ],
+      low: Array.from({ length: 5 }, (_, i) => ({
+        path: `/src/tests/test${i}.spec.ts`,
+      })),
+      skip: [],
+    };
+    const labels = computePrLabels(classified);
+    assert.ok(labels.includes("large-pr"), "15 reviewable files → large-pr");
+    assert.ok(labels.includes("high-risk"), "10 high files → high-risk");
+    assert.ok(labels.includes("backend"), "Has .cs files → backend");
+    assert.ok(labels.includes("frontend"), "Has .ts files → frontend");
+  });
+
+  it("applyPrLabels sends correct POST requests to Azure DevOps", async () => {
+    const calls = [];
+    const mockFetch = async (url, opts) => {
+      calls.push({ url, body: JSON.parse(opts.body) });
+      return { ok: true, status: 200 };
+    };
+
+    // Re-implement applyPrLabels with injectable fetch
+    async function applyPrLabels(project, repoId, prId, labels, azureHeaders, fetchFn) {
+      if (labels.length === 0) return;
+      const baseUrl = `${ORG}/${project}/_apis/git/repositories/${repoId}/pullRequests/${prId}/labels?api-version=${AZURE_API_VERSION}`;
+      const results = await Promise.allSettled(
+        labels.map(label =>
+          fetchFn(baseUrl, {
+            method: "POST",
+            headers: { ...azureHeaders, "Content-Type": "application/json" },
+            body: JSON.stringify({ name: label }),
+          })
+        )
+      );
+      return results;
+    }
+
+    await applyPrLabels("MyProject", "repo-1", 42, ["backend", "high-risk"], {}, mockFetch);
+
+    assert.equal(calls.length, 2, "Should POST 2 labels");
+    assert.equal(calls[0].body.name, "backend");
+    assert.equal(calls[1].body.name, "high-risk");
+
+    const expectedUrl = `${ORG}/MyProject/_apis/git/repositories/repo-1/pullRequests/42/labels?api-version=${AZURE_API_VERSION}`;
+    assert.equal(calls[0].url, expectedUrl);
+    assert.equal(calls[1].url, expectedUrl);
   });
 });

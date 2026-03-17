@@ -13,10 +13,21 @@ const MAX_BATCH_FILES = 20;
 const PLAYWRIGHT_REPO_NAME = "BindTuning.AdminApp";
 const PLAYWRIGHT_TARGET_BRANCH = "refs/heads/Dev";
 
+const STARTUP_TIME = Date.now();
+
 export default {
   async fetch(request, env, ctx) {
+    // ── Health endpoint ──────────────────────────────────────────────────
+    if (request.method === "GET") {
+      return Response.json({
+        status: "ok",
+        worker: "ai-pr-review-gateway",
+        uptime: Math.floor((Date.now() - STARTUP_TIME) / 1000),
+      });
+    }
+
     if (request.method !== "POST") {
-      return new Response("Only POST allowed", { status: 405 });
+      return new Response("Only GET and POST allowed", { status: 405 });
     }
 
     let payload;
@@ -328,6 +339,70 @@ function classifyFiles(entries) {
   return { skip, high, low };
 }
 
+// ─── PR Auto-Tagging ────────────────────────────────────────────────────────
+
+const BACKEND_PATTERN = /\.(cs|py|go|rs|java|kt|rb)$/i;
+const FRONTEND_PATTERN = /\.(ts|tsx|js|jsx|vue|svelte|component\.html)$/i;
+
+/**
+ * Compute PR labels based on file classification (zero subrequests — pure logic).
+ * Returns an array of label strings.
+ */
+function computePrLabels(classified) {
+  const labels = [];
+  const allReviewable = [...classified.high, ...classified.low];
+  const totalFiles = allReviewable.length + classified.skip.length;
+
+  // docs-only: every file was skipped (no reviewable files)
+  if (allReviewable.length === 0 && classified.skip.length > 0) {
+    labels.push("docs-only");
+    return labels;
+  }
+
+  // large-pr: 15+ reviewable files
+  if (allReviewable.length >= 15) {
+    labels.push("large-pr");
+  }
+
+  // high-risk: 5+ high-priority files
+  if (classified.high.length >= 5) {
+    labels.push("high-risk");
+  }
+
+  // frontend / backend detection
+  const hasBackend = allReviewable.some(f => BACKEND_PATTERN.test(f.path));
+  const hasFrontend = allReviewable.some(f => FRONTEND_PATTERN.test(f.path));
+  if (hasBackend) labels.push("backend");
+  if (hasFrontend) labels.push("frontend");
+
+  return labels;
+}
+
+/**
+ * Apply labels to an Azure DevOps PR.
+ * Uses POST to add each label individually (Azure DevOps Labels API).
+ * Fire-and-forget — failures are logged but don't block the review.
+ */
+async function applyPrLabels(project, repoId, prId, labels, azureHeaders) {
+  if (labels.length === 0) return;
+
+  const baseUrl = `${ORG}/${project}/_apis/git/repositories/${repoId}/pullRequests/${prId}/labels?api-version=${AZURE_API_VERSION}`;
+
+  const results = await Promise.allSettled(
+    labels.map(label =>
+      fetch(baseUrl, {
+        method: "POST",
+        headers: { ...azureHeaders, "Content-Type": "application/json" },
+        body: JSON.stringify({ name: label }),
+      })
+    )
+  );
+
+  const succeeded = results.filter(r => r.status === "fulfilled" && r.value?.ok).length;
+  const failed = results.length - succeeded;
+  console.log(`(log) [Gateway] PR labels: ${succeeded} applied, ${failed} failed (${labels.join(", ")})`);
+}
+
 // ─── Playwright Eligibility & Delegation ────────────────────────────────────
 
 /**
@@ -437,6 +512,13 @@ async function processReview(payload, env) {
     // 4. Classify all files (zero subrequests!)
     const classified = classifyFiles(entries);
     console.log(`(log) [Gateway] Classification: ${classified.high.length} HIGH, ${classified.low.length} LOW, ${classified.skip.length} SKIP`);
+
+    // 4b. Auto-tag PR with labels based on classification (fire-and-forget)
+    const prLabels = computePrLabels(classified);
+    if (prLabels.length > 0) {
+      applyPrLabels(project, repoId, prId, prLabels, azureHeaders)
+        .catch(e => console.log("(log) [Gateway] Label apply error:", e.message));
+    }
 
     // Reviewable = HIGH first, then LOW
     const reviewableFiles = [...classified.high, ...classified.low];

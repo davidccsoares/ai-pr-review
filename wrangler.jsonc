@@ -23,12 +23,10 @@
 	],
 	"kv_namespaces": [
 		{ "binding": "BOT_KV", "id": "2360521973a242ffb6a2173389758694" }
-	]
-	/**
-	 * Smart Placement
-	 * https://developers.cloudflare.com/workers/configuration/smart-placement/#smart-placement
-	 */
-	// "placement": {  "mode": "smart" }
+	],
+	// Smart Placement — run the worker closer to Azure DevOps backend
+	// https://developers.cloudflare.com/workers/configuration/smart-placement/
+	"placement": { "mode": "smart" }
 	/**
 	 * Bindings
 	 * Bindings allow your Worker to interact with resources on the Cloudflare Developer Platform, including
