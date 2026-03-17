@@ -427,6 +427,47 @@ function riskLevel(score) {
   return "HIGH";
 }
 
+// ─── Secret/Credential Detection ─────────────────────────────────────────────
+// Pure regex — zero neuron cost, zero subrequests.
+
+const SECRET_PATTERNS = [
+  { regex: /password\s*[=:]\s*["'][^"']+/i, label: "Hardcoded password" },
+  { regex: /api[_-]?key\s*[=:]\s*["'][^"']+/i, label: "API key" },
+  { regex: /secret\s*[=:]\s*["'][^"']+/i, label: "Secret value" },
+  { regex: /Bearer\s+[A-Za-z0-9._-]{20,}/, label: "Bearer token" },
+  { regex: /-----BEGIN\s+(RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----/, label: "Private key" },
+  { regex: /ghp_[A-Za-z0-9]{36}/, label: "GitHub PAT" },
+  { regex: /connectionString\s*[=:]\s*["'][^"']+/i, label: "Connection string" },
+  { regex: /client[_-]?secret\s*[=:]\s*["'][^"']+/i, label: "Client secret" },
+];
+
+/**
+ * Scan file diffs for accidentally committed secrets/credentials.
+ * Only scans added lines (lines prefixed with "+").
+ * Returns array of { file, line, pattern } findings.
+ */
+function scanForSecrets(fileChanges) {
+  const findings = [];
+  for (const fc of fileChanges) {
+    if (!fc.diff) continue;
+    const lines = fc.diff.split("\n");
+    for (const line of lines) {
+      // Only scan added lines (prefixed with "+")
+      const addMatch = line.match(/^\+(\d+):\s*(.*)/);
+      if (!addMatch) continue;
+      const lineNum = parseInt(addMatch[1], 10);
+      const content = addMatch[2];
+      for (const sp of SECRET_PATTERNS) {
+        if (sp.regex.test(content)) {
+          findings.push({ file: fc.path, line: lineNum, pattern: sp.label });
+          break; // One finding per line is enough
+        }
+      }
+    }
+  }
+  return findings;
+}
+
 // ─── Batch Helper: Truncate diff at hunk boundary ──────────────────────────
 
 /**
@@ -762,6 +803,61 @@ async function selfCall(batchPayload, requestUrl) {
   return true;
 }
 
+// ─── Inline File-Level Thread Comments ────────────────────────────────────
+
+const MAX_INLINE_COMMENTS = 10;
+
+/**
+ * Post inline thread comments on the PR for individual file/line findings.
+ * These appear as file-level threads in Azure DevOps, supplementing the
+ * unified summary comment.
+ *
+ * Capped at MAX_INLINE_COMMENTS to stay within subrequest budget.
+ * Uses Promise.allSettled() to post in parallel and tolerate partial failures.
+ */
+async function postInlineComments(project, repoId, prId, comments, azureHeaders) {
+  if (!comments || comments.length === 0) return;
+
+  // Prioritize non-LGTM comments and cap at max
+  const toPost = comments
+    .filter(c => c.file && c.line && c.comment && !c.comment.toLowerCase().includes("lgtm"))
+    .slice(0, MAX_INLINE_COMMENTS);
+
+  if (toPost.length === 0) return;
+
+  console.log(`(log) [Review] Posting ${toPost.length} inline thread comments for PR ${prId}`);
+
+  const threadUrl = `${ORG}/${project}/_apis/git/repositories/${repoId}/pullRequests/${prId}/threads?api-version=${AZURE_API_VERSION}`;
+
+  const results = await Promise.allSettled(
+    toPost.map(c =>
+      fetch(threadUrl, {
+        method: "POST",
+        headers: { ...azureHeaders, "Content-Type": "application/json" },
+        body: JSON.stringify({
+          comments: [
+            {
+              parentCommentId: 0,
+              content: c.comment,
+              commentType: 1,
+            },
+          ],
+          threadContext: {
+            filePath: c.file,
+            rightFileStart: { line: c.line, offset: 1 },
+            rightFileEnd: { line: c.line, offset: 1 },
+          },
+          status: 4, // closed (informational)
+        }),
+      })
+    )
+  );
+
+  const succeeded = results.filter(r => r.status === "fulfilled" && r.value.ok).length;
+  const failed = results.length - succeeded;
+  console.log(`(log) [Review] Inline comments: ${succeeded} posted, ${failed} failed`);
+}
+
 // ─── Post Unified Review Comment ────────────────────────────────────────────
 
 async function postUnifiedReview({
@@ -848,6 +944,17 @@ ${backlogContext || ""}`;
     summary.push(``);
   }
 
+  // ── Secret/Credential Detection (pure regex, zero cost) ──────────────
+  const secretFindings = scanForSecrets(allFileChanges);
+  if (secretFindings.length > 0) {
+    summary.push(`### \u{1F512} Security Alerts`, ``);
+    for (const f of secretFindings) {
+      const fileName = f.file.split("/").pop();
+      summary.push(`- **${f.pattern}** found in \`${fileName}\` at line ${f.line}`);
+    }
+    summary.push(``);
+  }
+
   if (workItems.length > 0) {
     summary.push(`### 📋 Linked Work Items`, ``);
     for (const wi of workItems) {
@@ -894,6 +1001,9 @@ ${backlogContext || ""}`;
   } else {
     summary.push(`✅ **No issues found.** Code looks good!`);
   }
+
+  // Post inline thread comments on individual files/lines (before the summary)
+  await postInlineComments(project, repoId, prId, allComments, azureHeaders);
 
   // Post the review
   const threadBaseUrl = `${ORG}/${project}/_apis/git/repositories/${repoId}/pullRequests/${prId}/threads?api-version=${AZURE_API_VERSION}`;

@@ -20,6 +20,9 @@
 	"services": [
 		{ "binding": "REVIEW_WORKER", "service": "ai-review-batch" },
 		{ "binding": "PW_CONTEXT", "service": "pw-context" }
+	],
+	"kv_namespaces": [
+		{ "binding": "BOT_KV", "id": "2360521973a242ffb6a2173389758694" }
 	]
 	/**
 	 * Smart Placement

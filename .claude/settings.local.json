@@ -27,7 +27,9 @@
       "Bash(echo \"=== Deploying pw-generate ===\" && npm run deploy:pw-generate 2>&1)",
       "Bash(echo \"=== Deploying review ===\" && npm run deploy:review 2>&1)",
       "Bash(echo \"=== Deploying pw-context ===\" && npm run deploy:pw-context 2>&1)",
-      "Bash(echo \"=== Deploying gateway ===\" && npm run deploy 2>&1)"
+      "Bash(echo \"=== Deploying gateway ===\" && npm run deploy 2>&1)",
+      "Bash(npm test:*)",
+      "Bash(npm install:*)"
     ]
   }
 }

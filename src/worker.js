@@ -384,6 +384,24 @@ async function processReview(payload, env) {
     const sourceCommit = payload.resource.lastMergeSourceCommit.commitId;
     const targetCommit = payload.resource.lastMergeTargetCommit.commitId;
 
+    // ── Webhook Deduplication ──────────────────────────────────────────────
+    // Prevent duplicate processing when Azure DevOps fires the same webhook
+    // multiple times for the same PR + commit combination.
+    try {
+      if (env?.BOT_KV) {
+        const dedupKey = `dedup:${prId}:${sourceCommit}`;
+        const existing = await env.BOT_KV.get(dedupKey);
+        if (existing) {
+          console.log(`(log) [Gateway] Duplicate webhook for PR ${prId} @ ${sourceCommit}, skipping`);
+          return;
+        }
+        await env.BOT_KV.put(dedupKey, "1", { expirationTtl: 3600 });
+      }
+    } catch (e) {
+      // Fail-open: if KV read/write fails, proceed normally
+      console.log("(log) [Gateway] KV dedup check failed (proceeding anyway):", e.message);
+    }
+
     console.log(`(log) [Gateway] Processing PR ${prId}: "${prTitle}"`);
     console.log(`(log) [Gateway] Source: ${sourceCommit} | Target: ${targetCommit}`);
 
