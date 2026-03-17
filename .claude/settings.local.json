@@ -17,7 +17,17 @@
       "Bash(cd \"C:\\\\Users\\\\david\\\\ai-pr-review\" && node -c src/worker.js && npx wrangler deploy)",
       "Bash(node:*)",
       "Bash(curl:*)",
-      "WebFetch(domain:dev.azure.com)"
+      "WebFetch(domain:dev.azure.com)",
+      "Read(//c/Users/david/**)",
+      "Read(//c/Users/david/Documents/**)",
+      "Bash(ls -la src/*.js wrangler*.jsonc)",
+      "Bash(ls -la src/*.js wrangler*.jsonc package.json)",
+      "Bash(echo \"\" && echo \"============================================================\" && echo \"=== FINAL VALIDATION SUMMARY ===\" && echo \"============================================================\" && echo \"\" && echo \"WORKERS:\" && echo \"  1. Gateway \\(ai-pr-review\\)       — src/worker.js           \\(493 lines, 21.57 KiB\\)\" && echo \"  2. Review \\(ai-review-batch\\)     — src/review-worker.js    \\(1155 lines, 35.34 KiB\\)\" && echo \"  3. PW-Context \\(pw-context\\)      — src/pw-context-worker.js \\(533 lines, 24.67 KiB\\)\" && echo \"  4. PW-Generate \\(pw-generate\\)    — src/pw-generate-worker.js \\(613 lines, 30.91 KiB\\)\" && echo \"  5. PW-Push \\(pw-push\\)            — src/pw-push-worker.js   \\(312 lines, 15.53 KiB\\)\" && echo \"\" && echo \"BINDINGS:\" && echo \"  Gateway:     env.REVIEW_WORKER \\(Worker\\), env.PW_CONTEXT \\(Worker\\), env.AI\" && echo \"  Review:      env.BOT_KV \\(KV\\), env.AI\" && echo \"  PW-Context:  env.BOT_KV \\(KV\\), env.PW_GENERATE \\(Worker\\), env.PW_PUSH \\(Worker\\)\" && echo \"  PW-Generate: env.BOT_KV \\(KV\\), env.AI\" && echo \"  PW-Push:     \\(none\\)\" && echo \"\" && echo \"CHECKS PASSED:\" && echo \"  ✓ 5/5 syntax checks\" && echo \"  ✓ 5/5 wrangler dry-run deploys\" && echo \"  ✓ 0 dangling references in gateway\" && echo \"  ✓ All service binding names match configs\" && echo \"  ✓ All required functions present in each worker\" && echo \"  ✓ All export defaults present\" && echo \"  ✓ Package.json has all deploy/dev scripts\" && echo \"  ✓ Review self-call uses request.url \\(HTTP, not service binding\\)\" && echo \"  ✓ Neuron tracking in review + pw-generate\" && echo \"  ✓ Doc caching in pw-context\" && echo \"  ✓ Cheaper model \\(Llama 3.2 3B\\) for PR summaries\" && echo \"\" && echo \"BEFORE DEPLOYING:\" && echo \"  1. Create KV namespace:\" && echo \"     npx wrangler kv namespace create BOT_KV\" && echo \"  2. Replace REPLACE_WITH_KV_NAMESPACE_ID in:\" && echo \"     - wrangler.review.jsonc\" && echo \"     - wrangler.pw-context.jsonc\" && echo \"     - wrangler.pw-generate.jsonc\" && echo \"  3. Set AZURE_TOKEN secret on new workers:\" && echo \"     echo \\\\\"YOUR_TOKEN\\\\\" | npx wrangler secret put AZURE_TOKEN --name ai-review-batch\" && echo \"  4. Deploy in order \\(leaf workers first\\):\" && echo \"     npm run deploy:pw-push\" && echo \"     npm run deploy:pw-generate\" && echo \"     npm run deploy:review\" && echo \"     npm run deploy:pw-context\" && echo \"     npm run deploy\" && echo \"\" && echo \"============================================================\" && echo \"=== ALL CHECKS PASSED — READY TO DEPLOY ===\" && echo \"============================================================\")",
+      "Bash(echo \"=== Deploying pw-push ===\" && npm run deploy:pw-push 2>&1)",
+      "Bash(echo \"=== Deploying pw-generate ===\" && npm run deploy:pw-generate 2>&1)",
+      "Bash(echo \"=== Deploying review ===\" && npm run deploy:review 2>&1)",
+      "Bash(echo \"=== Deploying pw-context ===\" && npm run deploy:pw-context 2>&1)",
+      "Bash(echo \"=== Deploying gateway ===\" && npm run deploy 2>&1)"
     ]
   }
 }

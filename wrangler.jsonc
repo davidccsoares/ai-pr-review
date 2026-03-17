@@ -15,7 +15,12 @@
 	],
 	"ai": {
 		"binding": "AI"
-	}
+	},
+	// Service Bindings — inter-worker calls don't count as subrequests!
+	"services": [
+		{ "binding": "REVIEW_WORKER", "service": "ai-review-batch" },
+		{ "binding": "PW_CONTEXT", "service": "pw-context" }
+	]
 	/**
 	 * Smart Placement
 	 * https://developers.cloudflare.com/workers/configuration/smart-placement/#smart-placement
@@ -43,5 +48,4 @@
 	 * Service Bindings (communicate between multiple Workers)
 	 * https://developers.cloudflare.com/workers/wrangler/configuration/#service-bindings
 	 */
-	// "services": [  {   "binding": "MY_SERVICE",   "service": "my-service"  } ]
 }

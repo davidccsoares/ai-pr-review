@@ -1,15 +1,13 @@
 {
 	"$schema": "node_modules/wrangler/config-schema.json",
-	"name": "playwright-test-gen",
-	"main": "src/playwright-worker.js",
+	"name": "pw-push",
+	"main": "src/pw-push-worker.js",
 	"compatibility_date": "2026-03-01",
 	"observability": {
 		"enabled": true
 	},
 	"compatibility_flags": [
 		"nodejs_compat"
-	],
-	"ai": {
-		"binding": "AI"
-	}
+	]
+	// No AI binding needed — this worker only does git push + pipeline + comments
 }

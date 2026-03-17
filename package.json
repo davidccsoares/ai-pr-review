@@ -4,9 +4,15 @@
 	"private": true,
 	"scripts": {
 		"deploy": "wrangler deploy",
-		"deploy:playwright": "wrangler deploy -c wrangler-playwright.jsonc",
+		"deploy:pw-context": "wrangler deploy -c wrangler.pw-context.jsonc",
+		"deploy:pw-push": "wrangler deploy -c wrangler.pw-push.jsonc",
+		"deploy:pw-generate": "wrangler deploy -c wrangler.pw-generate.jsonc",
+		"deploy:review": "wrangler deploy -c wrangler.review.jsonc",
 		"dev": "wrangler dev",
-		"dev:playwright": "wrangler dev -c wrangler-playwright.jsonc",
+		"dev:pw-context": "wrangler dev -c wrangler.pw-context.jsonc",
+		"dev:pw-push": "wrangler dev -c wrangler.pw-push.jsonc",
+		"dev:pw-generate": "wrangler dev -c wrangler.pw-generate.jsonc",
+		"dev:review": "wrangler dev -c wrangler.review.jsonc",
 		"start": "wrangler dev",
 		"test": "vitest"
 	},
