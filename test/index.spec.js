@@ -1,15 +1,36 @@
 import { env, createExecutionContext, waitOnExecutionContext, SELF } from 'cloudflare:test';
 import { describe, it, expect } from 'vitest';
-import worker from '../src';
+import worker from '../src/worker.js';
 
-describe('AI PR Review worker', () => {
-	it('rejects non-POST requests (unit style)', async () => {
+describe('AI PR Review gateway worker', () => {
+	it('returns health JSON on GET requests', async () => {
 		const request = new Request('http://example.com', { method: 'GET' });
 		const ctx = createExecutionContext();
 		const response = await worker.fetch(request, env, ctx);
 		await waitOnExecutionContext(ctx);
+		expect(response.status).toBe(200);
+		const body = await response.json();
+		expect(body.status).toBe('ok');
+		expect(body.worker).toBe('ai-pr-review-gateway');
+		expect(body.uptime).toBeTypeOf('number');
+	});
+
+	it('rejects PUT requests with 405', async () => {
+		const request = new Request('http://example.com', { method: 'PUT' });
+		const ctx = createExecutionContext();
+		const response = await worker.fetch(request, env, ctx);
+		await waitOnExecutionContext(ctx);
 		expect(response.status).toBe(405);
-		expect(await response.text()).toBe('Only POST allowed');
+		expect(await response.text()).toBe('Only GET and POST allowed');
+	});
+
+	it('rejects DELETE requests with 405', async () => {
+		const request = new Request('http://example.com', { method: 'DELETE' });
+		const ctx = createExecutionContext();
+		const response = await worker.fetch(request, env, ctx);
+		await waitOnExecutionContext(ctx);
+		expect(response.status).toBe(405);
+		expect(await response.text()).toBe('Only GET and POST allowed');
 	});
 
 	it('returns 200 for POST with no PR payload (unit style)', async () => {
@@ -61,8 +82,10 @@ describe('AI PR Review worker', () => {
 		expect(await response.text()).toBe('Accepted');
 	});
 
-	it('rejects non-POST requests (integration style)', async () => {
+	it('returns health JSON via integration-style GET', async () => {
 		const response = await SELF.fetch('http://example.com');
-		expect(response.status).toBe(405);
+		expect(response.status).toBe(200);
+		const body = await response.json();
+		expect(body.status).toBe('ok');
 	});
 });

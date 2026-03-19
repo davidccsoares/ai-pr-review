@@ -8,6 +8,10 @@
 	},
 	"compatibility_flags": [
 		"nodejs_compat"
-	]
+	],
+	"vars": {
+		"AZURE_ORG": "https://dev.azure.com/bindtuning",
+		"PIPELINE_ID": "88"
+	}
 	// No AI binding needed — this worker only does git push + pipeline + comments
 }

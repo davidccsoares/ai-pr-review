@@ -1,60 +1,14 @@
-const ORG = "https://dev.azure.com/bindtuning";
-const AZURE_API_VERSION = "7.0";
-const AZURE_API_VERSION_FILEDIFFS = "7.1";
+import { orgUrl, AZURE_API_VERSION, AZURE_API_VERSION_FILEDIFFS, fetchFileAtCommit } from "./lib/azure.js";
+import { checkNeuronBudget, recordNeuronUsage, NEURON_DAILY_LIMIT } from "./lib/neurons.js";
+import { fetchWithTimeout } from "./lib/fetch.js";
+
 const MAX_DIFF_SIZE = 60000;
-const MAX_FILE_DIFF = 3000;
-const MAX_BACKLOG_SIZE = 3000;
+const MAX_FILE_DIFF = 12000;
 const CONTEXT_LINES = 10;
-const MAX_BATCH_FILES = 20;
-const MAX_BATCHES = 15;
+const MAX_BATCH_FILES = 40;
+const MAX_BATCHES = 25;
 const CF_AI_MODEL = "@cf/mistralai/mistral-small-3.1-24b-instruct";
 const CF_AI_MODEL_CHEAP = "@cf/meta/llama-3.2-3b-instruct";
-
-// ─── Neuron Tracking ────────────────────────────────────────────────────────
-// Cloudflare Workers AI: 10,000 neurons/day (account-wide)
-// Mistral Small 3.1 24B: ~31,876 neurons/M input tokens, ~50,488 neurons/M output tokens
-// Llama 3.2 3B: much cheaper (~1/4 the cost)
-const NEURON_DAILY_LIMIT = 9000; // Leave 1K buffer
-const NEURONS_PER_INPUT_CHAR = 31876 / 4_000_000; // ~4 chars/token, per 1M tokens
-const NEURONS_PER_OUTPUT_CHAR = 50488 / 4_000_000;
-
-/**
- * Check if we have neuron budget remaining for today.
- * Returns { allowed: boolean, used: number }.
- */
-async function checkNeuronBudget(env) {
-  if (!env?.BOT_KV) return { allowed: true, used: 0 };
-  try {
-    const today = new Date().toISOString().slice(0, 10);
-    const used = parseInt(await env.BOT_KV.get(`neurons:${today}`) || "0", 10);
-    return { allowed: used < NEURON_DAILY_LIMIT, used };
-  } catch (e) {
-    console.log("(log) [Review] KV read error (neuron check):", e.message);
-    return { allowed: true, used: 0 }; // Fail open
-  }
-}
-
-/**
- * Record neuron usage after an AI call.
- * Estimates based on input prompt size + output size.
- */
-async function recordNeuronUsage(env, inputChars, outputChars) {
-  if (!env?.BOT_KV) return;
-  try {
-    const today = new Date().toISOString().slice(0, 10);
-    const key = `neurons:${today}`;
-    const current = parseInt(await env.BOT_KV.get(key) || "0", 10);
-    const estimated = Math.ceil(
-      inputChars * NEURONS_PER_INPUT_CHAR +
-      outputChars * NEURONS_PER_OUTPUT_CHAR
-    );
-    const newTotal = current + estimated;
-    await env.BOT_KV.put(key, String(newTotal), { expirationTtl: 86400 });
-    console.log(`(log) [Review] Neurons: +${estimated} (total today: ${newTotal})`);
-  } catch (e) {
-    console.log("(log) [Review] KV write error (neuron record):", e.message);
-  }
-}
 
 // ─── Review Worker — "The Reviewer" ─────────────────────────────────────────
 // Receives a batch of file paths + PR metadata from the Gateway worker.
@@ -73,34 +27,29 @@ export default {
       return new Response("Invalid JSON", { status: 400 });
     }
 
+    // Extract azureToken from header (preferred for self-calls) or body (service binding calls)
+    const headerToken = request.headers.get("X-Azure-Token");
+    if (headerToken && !payload.azureToken) {
+      payload.azureToken = headerToken;
+    }
+
     // Batch continuation routing — self-calls from previous batch
     if (payload.__isBatchContinuation) {
       console.log(`(log) [Review] Batch continuation #${payload.batchNumber} received`);
-      ctx.waitUntil(processBatch(payload, env, request));
+      ctx.waitUntil(processBatch(payload, env));
       return new Response("Batch accepted", { status: 202 });
     }
 
     // Initial batch from gateway
     if (payload.__isReviewRequest) {
       console.log(`(log) [Review] Initial review request for PR ${payload.pr?.id}`);
-      ctx.waitUntil(processInitialBatch(payload, env, request));
+      ctx.waitUntil(processInitialBatch(payload, env));
       return new Response("Review accepted", { status: 202 });
     }
 
     return new Response("Unknown payload", { status: 400 });
   },
 };
-
-// ─── Helpers ────────────────────────────────────────────────────────────────
-
-async function fetchFileAtCommit(project, repoId, path, commitId, headers) {
-  const url = `${ORG}/${project}/_apis/git/repositories/${repoId}/items?path=${encodeURIComponent(
-    path
-  )}&versionDescriptor.version=${commitId}&versionDescriptor.versionType=commit&includeContent=true&api-version=${AZURE_API_VERSION}`;
-  const res = await fetch(url, { headers });
-  if (!res.ok) return null;
-  return res.text();
-}
 
 // ─── Diff Algorithms ────────────────────────────────────────────────────────
 
@@ -347,7 +296,7 @@ function simpleFallbackDiff(oldLines, newLines) {
  * Unlike positional comparison, this handles line insertions/deletions without
  * causing every subsequent line to appear "changed".
  */
-function computeDiff(oldText, newText) {
+export function computeDiff(oldText, newText) {
   const oldLines = (oldText || "").split("\n");
   const newLines = (newText || "").split("\n");
 
@@ -411,7 +360,7 @@ function computeDiff(oldText, newText) {
 
 // ─── Risk Scoring ────────────────────────────────────────────────────────────
 
-function calculateRisk(fileChanges, totalChangedLines) {
+export function calculateRisk(fileChanges, totalChangedLines) {
   let score = 0;
   score += fileChanges.length * 2;
   score += Math.floor(totalChangedLines / 10);
@@ -421,7 +370,7 @@ function calculateRisk(fileChanges, totalChangedLines) {
   return Math.min(score, 100);
 }
 
-function riskLevel(score) {
+export function riskLevel(score) {
   if (score < 15) return "LOW";
   if (score < 35) return "MEDIUM";
   return "HIGH";
@@ -430,7 +379,7 @@ function riskLevel(score) {
 // ─── Secret/Credential Detection ─────────────────────────────────────────────
 // Pure regex — zero neuron cost, zero subrequests.
 
-const SECRET_PATTERNS = [
+export const SECRET_PATTERNS = [
   { regex: /password\s*[=:]\s*["'][^"']+/i, label: "Hardcoded password" },
   { regex: /api[_-]?key\s*[=:]\s*["'][^"']+/i, label: "API key" },
   { regex: /secret\s*[=:]\s*["'][^"']+/i, label: "Secret value" },
@@ -446,7 +395,7 @@ const SECRET_PATTERNS = [
  * Only scans added lines (lines prefixed with "+").
  * Returns array of { file, line, pattern } findings.
  */
-function scanForSecrets(fileChanges) {
+export function scanForSecrets(fileChanges) {
   const findings = [];
   for (const fc of fileChanges) {
     if (!fc.diff) continue;
@@ -474,7 +423,7 @@ function scanForSecrets(fileChanges) {
  * Truncate a diff string at a clean hunk boundary (at a "---" separator)
  * instead of cutting mid-line, which confuses the AI.
  */
-function truncateDiffAtHunkBoundary(diff, maxLen) {
+export function truncateDiffAtHunkBoundary(diff, maxLen) {
   if (diff.length <= maxLen) return diff;
 
   // Find the last "---" hunk separator before the limit
@@ -501,7 +450,8 @@ function truncateDiffAtHunkBoundary(diff, maxLen) {
  *  - 1 GET per file to fetch new content
  *  = 1 + N subrequests
  */
-async function fetchAndDiffFiles(files, project, repoId, sourceCommit, targetCommit, azureHeaders) {
+async function fetchAndDiffFiles(files, project, repoId, sourceCommit, targetCommit, headers, env) {
+  const ORG = orgUrl(env);
   const fileChanges = [];
   let totalChangedLines = 0;
 
@@ -512,14 +462,15 @@ async function fetchAndDiffFiles(files, project, repoId, sourceCommit, targetCom
   let fileDiffsData = [];
   try {
     console.log(`(log) [Review] Calling filediffs API: base=${targetCommit} target=${sourceCommit} for ${files.length} files`);
-    const fileDiffsRes = await fetch(fileDiffsUrl, {
+    const fileDiffsRes = await fetchWithTimeout(fileDiffsUrl, {
       method: "POST",
-      headers: { ...azureHeaders, "Content-Type": "application/json" },
+      headers: { ...headers, "Content-Type": "application/json" },
       body: JSON.stringify({
         baseVersionCommit: targetCommit,
         targetVersionCommit: sourceCommit,
         fileDiffParams,
       }),
+      timeout: 15_000,
     });
 
     if (fileDiffsRes.ok) {
@@ -559,7 +510,7 @@ async function fetchAndDiffFiles(files, project, repoId, sourceCommit, targetCom
   for (const f of files) {
     console.log(`(log) [Review] Processing file (${f.isAdd ? "add" : "edit"}): ${f.path}`);
 
-    const newContent = await fetchFileAtCommit(project, repoId, f.path, sourceCommit, azureHeaders);
+    const newContent = await fetchFileAtCommit(env, project, repoId, f.path, sourceCommit, headers);
 
     if (newContent === null) {
       console.log("(log) [Review] Skipping (could not fetch):", f.path);
@@ -703,7 +654,7 @@ ${backlogContext}
 ${diffBlock}`;
 
   // Check neuron budget before calling AI
-  const budget = await checkNeuronBudget(env);
+  const budget = await checkNeuronBudget(env, "Review");
   if (!budget.allowed) {
     console.log(`(log) [Review] Neuron budget exhausted (${budget.used}/${NEURON_DAILY_LIMIT}), skipping AI review`);
     return fileChanges.map(fc => ({
@@ -730,7 +681,7 @@ ${diffBlock}`;
   // Record neuron usage
   const inputChars = systemPrompt.length + userPrompt.length;
   const outputChars = rawReview?.length || 0;
-  await recordNeuronUsage(env, inputChars, outputChars);
+  await recordNeuronUsage(env, inputChars, outputChars, "Review");
 
   // Parse AI response into comments array
   try {
@@ -738,7 +689,8 @@ ${diffBlock}`;
     if (Array.isArray(rawResponse)) {
       comments = rawResponse;
     } else if (typeof rawResponse === "string") {
-      const jsonMatch = rawResponse.match(/\[[\s\S]*?\]/);
+      // Use greedy match to capture the entire JSON array (including nested arrays)
+      const jsonMatch = rawResponse.match(/\[[\s\S]*\]/);
       comments = jsonMatch ? JSON.parse(jsonMatch[0]) : [];
     } else {
       comments = [];
@@ -784,78 +736,54 @@ ${diffBlock}`;
   }
 }
 
-// ─── Batch Helper: Self-call to continue processing ─────────────────────────
+// ─── Batch Helper: Self-call via Service Binding ─────────────────────────────
+// Uses env.SELF (service binding to itself) to avoid counting as a subrequest.
+// Falls back to public fetch if the binding isn't configured.
 
-async function selfCall(batchPayload, requestUrl) {
+async function selfCall(batchPayload, env) {
   console.log(`(log) [Review] Self-calling for batch #${batchPayload.batchNumber}, ${batchPayload.remainingFiles.length} files remaining`);
 
-  const res = await fetch(requestUrl, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(batchPayload),
-  });
+  // Extract token from payload — send via header, not body, for self-calls
+  const azureToken = batchPayload.azureToken;
+  const payloadWithoutToken = { ...batchPayload };
+  delete payloadWithoutToken.azureToken;
 
-  if (!res.ok) {
-    console.error(`(log) [Review] Self-call failed: ${res.status} ${await res.text()}`);
+  const headers = {
+    "Content-Type": "application/json",
+    "X-Azure-Token": azureToken,
+  };
+  const body = JSON.stringify(payloadWithoutToken);
+
+  try {
+    let res;
+    if (env?.SELF) {
+      // Preferred: service binding (free, no subrequest, internal)
+      res = await env.SELF.fetch("https://self/", { method: "POST", headers, body });
+    } else {
+      // Fallback: public URL (counts as subrequest)
+      const requestUrl = batchPayload.requestUrl;
+      if (!requestUrl) {
+        console.error("(log) [Review] No SELF binding and no requestUrl, cannot self-call");
+        return false;
+      }
+      // Re-add token to body for fallback path
+      res = await fetchWithTimeout(requestUrl, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(batchPayload),
+      });
+    }
+
+    if (!res.ok) {
+      console.error(`(log) [Review] Self-call failed: ${res.status} ${await res.text()}`);
+      return false;
+    }
+    console.log("(log) [Review] Self-call accepted:", res.status);
+    return true;
+  } catch (e) {
+    console.error("(log) [Review] Self-call error:", e.message);
     return false;
   }
-  console.log("(log) [Review] Self-call accepted:", res.status);
-  return true;
-}
-
-// ─── Inline File-Level Thread Comments ────────────────────────────────────
-
-const MAX_INLINE_COMMENTS = 10;
-
-/**
- * Post inline thread comments on the PR for individual file/line findings.
- * These appear as file-level threads in Azure DevOps, supplementing the
- * unified summary comment.
- *
- * Capped at MAX_INLINE_COMMENTS to stay within subrequest budget.
- * Uses Promise.allSettled() to post in parallel and tolerate partial failures.
- */
-async function postInlineComments(project, repoId, prId, comments, azureHeaders) {
-  if (!comments || comments.length === 0) return;
-
-  // Prioritize non-LGTM comments and cap at max
-  const toPost = comments
-    .filter(c => c.file && c.line && c.comment && !c.comment.toLowerCase().includes("lgtm"))
-    .slice(0, MAX_INLINE_COMMENTS);
-
-  if (toPost.length === 0) return;
-
-  console.log(`(log) [Review] Posting ${toPost.length} inline thread comments for PR ${prId}`);
-
-  const threadUrl = `${ORG}/${project}/_apis/git/repositories/${repoId}/pullRequests/${prId}/threads?api-version=${AZURE_API_VERSION}`;
-
-  const results = await Promise.allSettled(
-    toPost.map(c =>
-      fetch(threadUrl, {
-        method: "POST",
-        headers: { ...azureHeaders, "Content-Type": "application/json" },
-        body: JSON.stringify({
-          comments: [
-            {
-              parentCommentId: 0,
-              content: c.comment,
-              commentType: 1,
-            },
-          ],
-          threadContext: {
-            filePath: c.file,
-            rightFileStart: { line: c.line, offset: 1 },
-            rightFileEnd: { line: c.line, offset: 1 },
-          },
-          status: 4, // closed (informational)
-        }),
-      })
-    )
-  );
-
-  const succeeded = results.filter(r => r.status === "fulfilled" && r.value.ok).length;
-  const failed = results.length - succeeded;
-  console.log(`(log) [Review] Inline comments: ${succeeded} posted, ${failed} failed`);
 }
 
 // ─── Post Unified Review Comment ────────────────────────────────────────────
@@ -864,8 +792,9 @@ async function postUnifiedReview({
   project, repoId, prId, prTitle,
   allFileChanges, allComments,
   workItems, totalFiles, skippedFiles,
-  batchCount, azureHeaders, env, backlogContext,
+  batchCount, azureHeaders: headers, env, backlogContext,
 }) {
+  const ORG = orgUrl(env);
   console.log(`(log) [Review] Posting unified review for PR ${prId} (${allFileChanges.length} files, ${allComments.length} comments, ${batchCount} batches)`);
 
   // Calculate risk
@@ -883,7 +812,7 @@ async function postUnifiedReview({
   // Generate PR summary for large PRs (uses cheaper model to save neurons)
   let prSummary = "";
   if (allFileChanges.length >= 5 || totalChangedLines > 100) {
-    const summaryBudget = await checkNeuronBudget(env);
+    const summaryBudget = await checkNeuronBudget(env, "Review");
     if (!summaryBudget.allowed) {
       console.log("(log) [Review] Skipping PR summary — neuron budget exhausted");
     } else {
@@ -906,7 +835,7 @@ ${backlogContext || ""}`;
         // Record neurons (cheaper model uses ~1/4 the neurons)
         const summaryInputChars = summarySystemPrompt.length + summaryPrompt.length;
         const summaryOutputChars = prSummary.length;
-        await recordNeuronUsage(env, summaryInputChars / 4, summaryOutputChars / 4);
+        await recordNeuronUsage(env, summaryInputChars / 4, summaryOutputChars / 4, "Review");
       } catch (e) {
         console.error("(log) [Review] PR summary failed:", e.message);
       }
@@ -1002,9 +931,6 @@ ${backlogContext || ""}`;
     summary.push(`✅ **No issues found.** Code looks good!`);
   }
 
-  // Post inline thread comments on individual files/lines (before the summary)
-  await postInlineComments(project, repoId, prId, allComments, azureHeaders);
-
   // Post the review
   const threadBaseUrl = `${ORG}/${project}/_apis/git/repositories/${repoId}/pullRequests/${prId}/threads?api-version=${AZURE_API_VERSION}`;
   const summaryBody = {
@@ -1018,9 +944,9 @@ ${backlogContext || ""}`;
     status: 4,
   };
 
-  const summaryRes = await fetch(threadBaseUrl, {
+  const summaryRes = await fetchWithTimeout(threadBaseUrl, {
     method: "POST",
-    headers: { ...azureHeaders, "Content-Type": "application/json" },
+    headers: { ...headers, "Content-Type": "application/json" },
     body: JSON.stringify(summaryBody),
   });
 
@@ -1033,7 +959,7 @@ ${backlogContext || ""}`;
 
 // ─── Initial Batch Processing (from Gateway) ────────────────────────────────
 
-async function processInitialBatch(payload, env, request) {
+async function processInitialBatch(payload, env) {
   try {
     const {
       pr, batchFiles, remainingFiles,
@@ -1041,12 +967,10 @@ async function processInitialBatch(payload, env, request) {
       totalFiles, skippedFiles, azureToken,
     } = payload;
 
-    const requestUrl = request.url;
-
     console.log(`(log) [Review] Processing initial batch for PR ${pr.id}: "${pr.title}"`);
     console.log(`(log) [Review] Source: ${pr.sourceCommit} | Target: ${pr.targetCommit}`);
 
-    const azureHeaders = {
+    const headers = {
       Authorization: `Basic ${btoa(":" + azureToken)}`,
     };
 
@@ -1054,7 +978,7 @@ async function processInitialBatch(payload, env, request) {
 
     // 1. Fetch content + compute diffs (1 + N subrequests)
     const { fileChanges } = await fetchAndDiffFiles(
-      batchFiles, pr.project, pr.repoId, pr.sourceCommit, pr.targetCommit, azureHeaders
+      batchFiles, pr.project, pr.repoId, pr.sourceCommit, pr.targetCommit, headers, env
     );
 
     // 2. AI review for this batch (1 subrequest)
@@ -1072,15 +996,14 @@ async function processInitialBatch(payload, env, request) {
         batchNumber: 1,
         totalFiles,
         skippedFiles,
-        requestUrl,
         azureToken,
       };
 
-      const success = await selfCall(batchPayload, requestUrl);
+      const success = await selfCall(batchPayload, env);
       if (!success) {
         // Self-call failed — retry once
         console.log("(log) [Review] Retrying self-call...");
-        const retrySuccess = await selfCall(batchPayload, requestUrl);
+        const retrySuccess = await selfCall(batchPayload, env);
         if (!retrySuccess) {
           // Post partial review with what we have
           console.log("(log) [Review] Self-call retry failed, posting partial review");
@@ -1092,7 +1015,7 @@ async function processInitialBatch(payload, env, request) {
             totalFiles,
             skippedFiles: skippedFiles + remainingFiles.length,
             batchCount: 1,
-            azureHeaders, env, backlogContext,
+            azureHeaders: headers, env, backlogContext,
           });
         }
       }
@@ -1106,7 +1029,7 @@ async function processInitialBatch(payload, env, request) {
         totalFiles,
         skippedFiles,
         batchCount: 1,
-        azureHeaders, env, backlogContext,
+        azureHeaders: headers, env, backlogContext,
       });
     }
 
@@ -1118,18 +1041,18 @@ async function processInitialBatch(payload, env, request) {
 
 // ─── Batch N Processing (self-call continuation) ────────────────────────────
 
-async function processBatch(payload, env, request) {
+async function processBatch(payload, env) {
   try {
     const {
       pr, backlogContext, workItems, remainingFiles,
       accumulatedResults, batchNumber, totalFiles, skippedFiles,
-      requestUrl, azureToken,
+      azureToken,
     } = payload;
 
     // Safety: prevent infinite loops
     if (batchNumber > MAX_BATCHES) {
       console.error(`(log) [Review] Exceeded MAX_BATCHES (${MAX_BATCHES}), posting partial review`);
-      const azureHeaders = { Authorization: `Basic ${btoa(":" + azureToken)}` };
+      const headers = { Authorization: `Basic ${btoa(":" + azureToken)}` };
       await postUnifiedReview({
         project: pr.project, repoId: pr.repoId, prId: pr.id, prTitle: pr.title,
         allFileChanges: accumulatedResults.fileChanges,
@@ -1138,7 +1061,7 @@ async function processBatch(payload, env, request) {
         totalFiles,
         skippedFiles: skippedFiles + remainingFiles.length,
         batchCount: batchNumber,
-        azureHeaders, env, backlogContext,
+        azureHeaders: headers, env, backlogContext,
       });
       return;
     }
@@ -1146,7 +1069,7 @@ async function processBatch(payload, env, request) {
     // Safety: verify remaining files is decreasing
     if (remainingFiles.length === 0) {
       console.log("(log) [Review] No remaining files, posting final review");
-      const azureHeaders = { Authorization: `Basic ${btoa(":" + azureToken)}` };
+      const headers = { Authorization: `Basic ${btoa(":" + azureToken)}` };
       await postUnifiedReview({
         project: pr.project, repoId: pr.repoId, prId: pr.id, prTitle: pr.title,
         allFileChanges: accumulatedResults.fileChanges,
@@ -1155,12 +1078,12 @@ async function processBatch(payload, env, request) {
         totalFiles,
         skippedFiles,
         batchCount: batchNumber,
-        azureHeaders, env, backlogContext,
+        azureHeaders: headers, env, backlogContext,
       });
       return;
     }
 
-    const azureHeaders = { Authorization: `Basic ${btoa(":" + azureToken)}` };
+    const headers = { Authorization: `Basic ${btoa(":" + azureToken)}` };
 
     // Batch N can take 22 files (no overhead subrequests needed)
     const BATCH_N_SIZE = MAX_BATCH_FILES + 2;
@@ -1169,9 +1092,9 @@ async function processBatch(payload, env, request) {
 
     console.log(`(log) [Review] Batch ${batchNumber}: processing ${batchFiles.length} files, ${nextRemaining.length} remaining`);
 
-    // Fetch content + compute diffs (2 subrequests per file)
+    // Fetch content + compute diffs
     const { fileChanges } = await fetchAndDiffFiles(
-      batchFiles, pr.project, pr.repoId, pr.sourceCommit, pr.targetCommit, azureHeaders
+      batchFiles, pr.project, pr.repoId, pr.sourceCommit, pr.targetCommit, headers, env
     );
 
     // AI review for this batch (1 subrequest)
@@ -1204,14 +1127,13 @@ async function processBatch(payload, env, request) {
         batchNumber: batchNumber + 1,
         totalFiles,
         skippedFiles,
-        requestUrl,
         azureToken,
       };
 
-      const success = await selfCall(nextPayload, requestUrl);
+      const success = await selfCall(nextPayload, env);
       if (!success) {
         console.log("(log) [Review] Self-call failed, retrying...");
-        const retrySuccess = await selfCall(nextPayload, requestUrl);
+        const retrySuccess = await selfCall(nextPayload, env);
         if (!retrySuccess) {
           console.log("(log) [Review] Retry failed, posting partial review");
           await postUnifiedReview({
@@ -1222,7 +1144,7 @@ async function processBatch(payload, env, request) {
             totalFiles,
             skippedFiles: skippedFiles + nextRemaining.length,
             batchCount: batchNumber + 1,
-            azureHeaders, env, backlogContext,
+            azureHeaders: headers, env, backlogContext,
           });
         }
       }
@@ -1237,7 +1159,7 @@ async function processBatch(payload, env, request) {
         totalFiles,
         skippedFiles,
         batchCount: batchNumber + 1,
-        azureHeaders, env, backlogContext,
+        azureHeaders: headers, env, backlogContext,
       });
     }
 
@@ -1246,7 +1168,7 @@ async function processBatch(payload, env, request) {
     console.error(`(log) [Review] Error in processBatch #${payload.batchNumber}:`, err.stack || err);
     // Try to post partial review with what we have
     try {
-      const azureHeaders = { Authorization: `Basic ${btoa(":" + payload.azureToken)}` };
+      const headers = { Authorization: `Basic ${btoa(":" + payload.azureToken)}` };
       await postUnifiedReview({
         project: payload.pr.project, repoId: payload.pr.repoId,
         prId: payload.pr.id, prTitle: payload.pr.title,
@@ -1256,7 +1178,7 @@ async function processBatch(payload, env, request) {
         totalFiles: payload.totalFiles,
         skippedFiles: payload.skippedFiles + payload.remainingFiles.length,
         batchCount: payload.batchNumber,
-        azureHeaders, env, backlogContext: payload.backlogContext,
+        azureHeaders: headers, env, backlogContext: payload.backlogContext,
       });
     } catch (postErr) {
       console.error("(log) [Review] Could not post partial review:", postErr.message);

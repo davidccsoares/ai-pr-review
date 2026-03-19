@@ -14,7 +14,9 @@
 		"dev:pw-generate": "wrangler dev -c wrangler.pw-generate.jsonc",
 		"dev:review": "wrangler dev -c wrangler.review.jsonc",
 		"start": "wrangler dev",
-		"test": "vitest"
+		"test": "vitest",
+		"test:unit": "vitest run -c vitest.unit.config.js",
+		"test:integration": "vitest run -c vitest.config.js"
 	},
 	"devDependencies": {
 		"@cloudflare/vitest-pool-workers": "^0.12.4",

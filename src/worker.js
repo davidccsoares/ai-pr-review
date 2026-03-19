@@ -1,17 +1,9 @@
-const ORG = "https://dev.azure.com/bindtuning";
-const AZURE_API_VERSION = "7.0";
+import { orgUrl, AZURE_API_VERSION, azureHeaders as buildAzureHeaders } from "./lib/azure.js";
+import { fetchWithTimeout } from "./lib/fetch.js";
+
 const MAX_BACKLOG_SIZE = 3000;
-const MAX_BATCH_FILES = 20;
-
-// ─── Worker URLs (fallback if service bindings are not available) ────────────
-// Service bindings (env.REVIEW_WORKER, env.PW_CONTEXT) are preferred — they
-// don't count as subrequests. These URLs are kept as documentation only.
-// const REVIEW_WORKER_URL = "https://ai-review-batch.soarespt0.workers.dev";
-// const PW_CONTEXT_WORKER_URL = "https://pw-context.soarespt0.workers.dev";
-
-// ─── Playwright Test Generation ─────────────────────────────────────────────
-const PLAYWRIGHT_REPO_NAME = "BindTuning.AdminApp";
-const PLAYWRIGHT_TARGET_BRANCH = "refs/heads/Dev";
+const MAX_BATCH_FILES = 40;
+const MAX_WEBHOOKS_PER_HOUR = 30;
 
 const STARTUP_TIME = Date.now();
 
@@ -44,6 +36,25 @@ export default {
       return new Response("No PR", { status: 200 });
     }
 
+    // ── Rate Limiting ────────────────────────────────────────────────────
+    // Limit webhook processing to MAX_WEBHOOKS_PER_HOUR to protect neuron
+    // budget and Azure API quota.
+    try {
+      if (env?.BOT_KV) {
+        const hour = new Date().toISOString().slice(0, 13); // "2026-03-19T14"
+        const rateKey = `rate:${hour}`;
+        const current = parseInt(await env.BOT_KV.get(rateKey) || "0", 10);
+        if (current >= MAX_WEBHOOKS_PER_HOUR) {
+          console.log(`(log) [Gateway] Rate limit exceeded (${current}/${MAX_WEBHOOKS_PER_HOUR} this hour)`);
+          return new Response("Rate limit exceeded", { status: 429 });
+        }
+        await env.BOT_KV.put(rateKey, String(current + 1), { expirationTtl: 3600 });
+      }
+    } catch (e) {
+      // Fail-open: if KV fails, proceed normally
+      console.log("(log) [Gateway] Rate limit check failed (proceeding anyway):", e.message);
+    }
+
     ctx.waitUntil(processReview(payload, env));
     return new Response("Accepted", { status: 202 });
   },
@@ -51,7 +62,7 @@ export default {
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
-function stripHtml(html) {
+export function stripHtml(html) {
   if (!html) return "";
   return html
     .replace(/<br\s*\/?>/gi, "\n")
@@ -72,11 +83,12 @@ function stripHtml(html) {
  * Fetch work items linked to a PR, then walk up to parent user stories.
  * Returns an array of { id, type, title, description, acceptanceCriteria, parent? }.
  */
-async function fetchLinkedWorkItems(project, repoId, prId, headers) {
+async function fetchLinkedWorkItems(env, project, repoId, prId, headers) {
+  const ORG = orgUrl(env);
   try {
     // 1. Get work item refs linked to the PR
     const refsUrl = `${ORG}/${project}/_apis/git/repositories/${repoId}/pullRequests/${prId}/workitems?api-version=${AZURE_API_VERSION}`;
-    const refsRes = await fetch(refsUrl, { headers });
+    const refsRes = await fetchWithTimeout(refsUrl, { headers });
     if (!refsRes.ok) {
       console.log("(log) [Gateway] Could not fetch PR work item refs:", refsRes.status);
       return [];
@@ -88,7 +100,7 @@ async function fetchLinkedWorkItems(project, repoId, prId, headers) {
     // 2. Batch-fetch full work item details (with relations so we can find parents)
     const ids = refs.map((r) => r.id).join(",");
     const wiUrl = `${ORG}/${project}/_apis/wit/workitems?ids=${ids}&$expand=relations&api-version=${AZURE_API_VERSION}`;
-    const wiRes = await fetch(wiUrl, { headers });
+    const wiRes = await fetchWithTimeout(wiUrl, { headers });
     if (!wiRes.ok) {
       console.log("(log) [Gateway] Could not fetch work item details:", wiRes.status);
       return [];
@@ -125,7 +137,7 @@ async function fetchLinkedWorkItems(project, repoId, prId, headers) {
     if (parentIds.size > 0) {
       const parentIdsStr = [...parentIds].join(",");
       const parentUrl = `${ORG}/${project}/_apis/wit/workitems?ids=${parentIdsStr}&api-version=${AZURE_API_VERSION}`;
-      const parentRes = await fetch(parentUrl, { headers });
+      const parentRes = await fetchWithTimeout(parentUrl, { headers });
       if (parentRes.ok) {
         const parentData = await parentRes.json();
         for (const pw of parentData.value || []) {
@@ -163,7 +175,7 @@ async function fetchLinkedWorkItems(project, repoId, prId, headers) {
 /**
  * Build a backlog context string from work items, respecting MAX_BACKLOG_SIZE.
  */
-function buildBacklogContext(workItems) {
+export function buildBacklogContext(workItems) {
   if (workItems.length === 0) return "";
 
   let context = "\n## Linked Work Items (Product Backlog)\n";
@@ -201,7 +213,7 @@ function buildBacklogContext(workItems) {
 
 // ─── File Classifier (zero subrequests — path-only) ─────────────────────────
 
-const SKIP_PATTERNS = [
+export const SKIP_PATTERNS = [
   // ── Lock files & package managers ──
   /package-lock\.json$/i, /yarn\.lock$/i, /pnpm-lock\.yaml$/i,
   // ── C# generated / build artifacts ──
@@ -241,7 +253,7 @@ const LOW_FILE_EXTENSIONS = /\.(css|scss|sass|less)$/i;
 // Angular component templates have real logic — treat as HIGH, not LOW
 const ANGULAR_TEMPLATE = /\.component\.html$/i;
 
-const PRIORITY_KEYWORDS = [
+export const PRIORITY_KEYWORDS = [
   // ── C# backend ──
   { pattern: /(controller|handler|endpoint)/i, score: 10 },
   { pattern: /(service|repository|provider|manager)/i, score: 8 },
@@ -272,7 +284,7 @@ const PRIORITY_KEYWORDS = [
  * Returns { skip: [...], high: [...], low: [...] }
  * High files are sorted by priority score (highest first).
  */
-function classifyFiles(entries) {
+export function classifyFiles(entries) {
   const skip = [];
   const high = [];
   const low = [];
@@ -348,10 +360,9 @@ const FRONTEND_PATTERN = /\.(ts|tsx|js|jsx|vue|svelte|component\.html)$/i;
  * Compute PR labels based on file classification (zero subrequests — pure logic).
  * Returns an array of label strings.
  */
-function computePrLabels(classified) {
+export function computePrLabels(classified) {
   const labels = [];
   const allReviewable = [...classified.high, ...classified.low];
-  const totalFiles = allReviewable.length + classified.skip.length;
 
   // docs-only: every file was skipped (no reviewable files)
   if (allReviewable.length === 0 && classified.skip.length > 0) {
@@ -383,16 +394,17 @@ function computePrLabels(classified) {
  * Uses POST to add each label individually (Azure DevOps Labels API).
  * Fire-and-forget — failures are logged but don't block the review.
  */
-async function applyPrLabels(project, repoId, prId, labels, azureHeaders) {
+async function applyPrLabels(env, project, repoId, prId, labels, headers) {
   if (labels.length === 0) return;
+  const ORG = orgUrl(env);
 
   const baseUrl = `${ORG}/${project}/_apis/git/repositories/${repoId}/pullRequests/${prId}/labels?api-version=${AZURE_API_VERSION}`;
 
   const results = await Promise.allSettled(
     labels.map(label =>
-      fetch(baseUrl, {
+      fetchWithTimeout(baseUrl, {
         method: "POST",
-        headers: { ...azureHeaders, "Content-Type": "application/json" },
+        headers: { ...headers, "Content-Type": "application/json" },
         body: JSON.stringify({ name: label }),
       })
     )
@@ -409,11 +421,12 @@ async function applyPrLabels(project, repoId, prId, labels, azureHeaders) {
  * Check whether the PR webhook targets the AdminApp repo's Dev branch.
  * Only those PRs should trigger Playwright test generation.
  */
-function isPlaywrightEligible(payload) {
+function isPlaywrightEligible(payload, env) {
   const repoName = payload.resource?.repository?.name;
   const targetBranch = payload.resource?.targetRefName;
-  return repoName === PLAYWRIGHT_REPO_NAME
-    && targetBranch === PLAYWRIGHT_TARGET_BRANCH;
+  const expectedRepo = env?.PLAYWRIGHT_REPO_NAME || "BindTuning.AdminApp";
+  const expectedBranch = env?.PLAYWRIGHT_TARGET_BRANCH || "refs/heads/Dev";
+  return repoName === expectedRepo && targetBranch === expectedBranch;
 }
 
 /**
@@ -451,17 +464,15 @@ function firePlaywrightWorker({ payload, fileChanges, env }) {
 // ─── Main Review Logic ──────────────────────────────────────────────────────
 
 async function processReview(payload, env) {
-  try {
-    const prId = payload.resource.pullRequestId;
-    const repoId = payload.resource.repository.id;
-    const project = payload.resource.repository.project.name;
-    const prTitle = payload.resource.title || "";
-    const sourceCommit = payload.resource.lastMergeSourceCommit.commitId;
-    const targetCommit = payload.resource.lastMergeTargetCommit.commitId;
+  const prId = payload.resource.pullRequestId;
+  const repoId = payload.resource.repository.id;
+  const project = payload.resource.repository.project.name;
+  const prTitle = payload.resource.title || "";
+  const sourceCommit = payload.resource.lastMergeSourceCommit.commitId;
+  const targetCommit = payload.resource.lastMergeTargetCommit.commitId;
 
-    // ── Webhook Deduplication ──────────────────────────────────────────────
-    // Prevent duplicate processing when Azure DevOps fires the same webhook
-    // multiple times for the same PR + commit combination.
+  try {
+    // ── Webhook Deduplication (check only — write AFTER success) ─────────
     try {
       if (env?.BOT_KV) {
         const dedupKey = `dedup:${prId}:${sourceCommit}`;
@@ -470,23 +481,22 @@ async function processReview(payload, env) {
           console.log(`(log) [Gateway] Duplicate webhook for PR ${prId} @ ${sourceCommit}, skipping`);
           return;
         }
-        await env.BOT_KV.put(dedupKey, "1", { expirationTtl: 3600 });
+        // Don't write yet — we'll write after successful delegation (#12)
       }
     } catch (e) {
-      // Fail-open: if KV read/write fails, proceed normally
+      // Fail-open: if KV read fails, proceed normally
       console.log("(log) [Gateway] KV dedup check failed (proceeding anyway):", e.message);
     }
 
     console.log(`(log) [Gateway] Processing PR ${prId}: "${prTitle}"`);
     console.log(`(log) [Gateway] Source: ${sourceCommit} | Target: ${targetCommit}`);
+    const ORG = orgUrl(env);
 
-    const azureHeaders = {
-      Authorization: `Basic ${btoa(":" + env.AZURE_TOKEN)}`,
-    };
+    const headers = buildAzureHeaders(env.AZURE_TOKEN);
 
     // 1. Get latest iteration (1 subrequest)
     const iterUrl = `${ORG}/${project}/_apis/git/repositories/${repoId}/pullRequests/${prId}/iterations?api-version=${AZURE_API_VERSION}`;
-    const iterRes = await fetch(iterUrl, { headers: azureHeaders });
+    const iterRes = await fetchWithTimeout(iterUrl, { headers });
     if (!iterRes.ok) {
       console.error("(log) [Gateway] Failed to fetch iterations:", iterRes.status);
       return;
@@ -496,7 +506,7 @@ async function processReview(payload, env) {
 
     // 2. Get changed files (1 subrequest)
     const changesUrl = `${ORG}/${project}/_apis/git/repositories/${repoId}/pullRequests/${prId}/iterations/${latestIteration}/changes?api-version=${AZURE_API_VERSION}`;
-    const changesRes = await fetch(changesUrl, { headers: azureHeaders });
+    const changesRes = await fetchWithTimeout(changesUrl, { headers });
     if (!changesRes.ok) {
       console.error("(log) [Gateway] Failed to fetch changes:", changesRes.status);
       return;
@@ -505,7 +515,7 @@ async function processReview(payload, env) {
     const entries = changesData.changeEntries || changesData.changes || [];
 
     // 3. Fetch linked work items (~3 subrequests)
-    const workItems = await fetchLinkedWorkItems(project, repoId, prId, azureHeaders);
+    const workItems = await fetchLinkedWorkItems(env, project, repoId, prId, headers);
     console.log(`(log) [Gateway] Linked work items: ${workItems.length}`);
     const backlogContext = buildBacklogContext(workItems);
 
@@ -516,7 +526,7 @@ async function processReview(payload, env) {
     // 4b. Auto-tag PR with labels based on classification (fire-and-forget)
     const prLabels = computePrLabels(classified);
     if (prLabels.length > 0) {
-      applyPrLabels(project, repoId, prId, prLabels, azureHeaders)
+      applyPrLabels(env, project, repoId, prId, prLabels, headers)
         .catch(e => console.log("(log) [Gateway] Label apply error:", e.message));
     }
 
@@ -568,10 +578,21 @@ async function processReview(payload, env) {
       console.error(`(log) [Gateway] Review worker failed: ${reviewRes.status} ${await reviewRes.text()}`);
     }
 
+    // ── Write dedup key AFTER successful delegation ─────────────────────
+    // This ensures that if processing fails, the retry webhook won't be blocked.
+    try {
+      if (env?.BOT_KV) {
+        const dedupKey = `dedup:${prId}:${sourceCommit}`;
+        await env.BOT_KV.put(dedupKey, "1", { expirationTtl: 3600 });
+      }
+    } catch (e) {
+      console.log("(log) [Gateway] KV dedup write failed (non-critical):", e.message);
+    }
+
     // 7. Playwright test generation (fire-and-forget to pw-context worker)
     //    We send it in parallel — the review worker handles the review,
     //    the playwright pipeline handles test generation independently.
-    if (isPlaywrightEligible(payload)) {
+    if (isPlaywrightEligible(payload, env)) {
       console.log("(log) [Gateway] PR is eligible for Playwright, delegating to pw-context worker");
       // Build minimal fileChanges for Playwright (just paths + change type)
       // The pw-context worker will fetch full content itself

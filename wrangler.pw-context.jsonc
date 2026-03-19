@@ -15,10 +15,11 @@
 		{ "binding": "PW_PUSH", "service": "pw-push" }
 	],
 	// KV namespace for .md doc caching (saves 3 subrequests when cache is warm)
-	// Create with: npx wrangler kv namespace create BOT_KV
-	// Then replace the id below with the actual namespace ID
 	"kv_namespaces": [
 		{ "binding": "BOT_KV", "id": "2360521973a242ffb6a2173389758694" }
-	]
+	],
+	"vars": {
+		"AZURE_ORG": "https://dev.azure.com/bindtuning"
+	}
 	// No AI binding needed — AI calls handled by pw-generate worker
 }

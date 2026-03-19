@@ -13,42 +13,9 @@
  * This worker will NEVER hit the 50-subrequest limit.
  */
 
+import { checkNeuronBudget, recordNeuronUsage, NEURON_DAILY_LIMIT } from "./lib/neurons.js";
+
 const CF_AI_MODEL = "@cf/mistralai/mistral-small-3.1-24b-instruct";
-
-// ─── Neuron Tracking ────────────────────────────────────────────────────────
-const NEURON_DAILY_LIMIT = 9000;
-const NEURONS_PER_INPUT_CHAR = 31876 / 4_000_000;
-const NEURONS_PER_OUTPUT_CHAR = 50488 / 4_000_000;
-
-async function checkNeuronBudget(env) {
-  if (!env?.BOT_KV) return { allowed: true, used: 0 };
-  try {
-    const today = new Date().toISOString().slice(0, 10);
-    const used = parseInt(await env.BOT_KV.get(`neurons:${today}`) || "0", 10);
-    return { allowed: used < NEURON_DAILY_LIMIT, used };
-  } catch (e) {
-    console.log("(log) [PW-Generate] KV read error (neuron check):", e.message);
-    return { allowed: true, used: 0 };
-  }
-}
-
-async function recordNeuronUsage(env, inputChars, outputChars) {
-  if (!env?.BOT_KV) return;
-  try {
-    const today = new Date().toISOString().slice(0, 10);
-    const key = `neurons:${today}`;
-    const current = parseInt(await env.BOT_KV.get(key) || "0", 10);
-    const estimated = Math.ceil(
-      inputChars * NEURONS_PER_INPUT_CHAR +
-      outputChars * NEURONS_PER_OUTPUT_CHAR
-    );
-    const newTotal = current + estimated;
-    await env.BOT_KV.put(key, String(newTotal), { expirationTtl: 86400 });
-    console.log(`(log) [PW-Generate] Neurons: +${estimated} (total today: ${newTotal})`);
-  } catch (e) {
-    console.log("(log) [PW-Generate] KV write error (neuron record):", e.message);
-  }
-}
 
 export default {
   async fetch(request, env, ctx) {
@@ -278,7 +245,7 @@ ${filesDescription}`;
     console.log("(log) [PW-Generate] Generating tests for", componentFiles.length, "files with", mdDocs.length, "docs");
 
     // Check neuron budget before calling AI
-    const budget = await checkNeuronBudget(env);
+    const budget = await checkNeuronBudget(env, "PW-Generate");
     if (!budget.allowed) {
       console.log(`(log) [PW-Generate] Neuron budget exhausted (${budget.used}/${NEURON_DAILY_LIMIT}), skipping test generation`);
       return null;
@@ -299,7 +266,7 @@ ${filesDescription}`;
     // Record neuron usage
     const inputChars = systemPrompt.length + userPrompt.length;
     const outputChars = rawStr?.length || 0;
-    await recordNeuronUsage(env, inputChars, outputChars);
+    await recordNeuronUsage(env, inputChars, outputChars, "PW-Generate");
 
     // Parse the JSON array from the AI response
     let tests;
@@ -310,6 +277,7 @@ ${filesDescription}`;
       let cleaned = raw.trim();
       cleaned = cleaned.replace(/^```(?:json)?\s*\n?/i, "").replace(/\n?```\s*$/, "");
 
+      // Use greedy match to capture the entire JSON array (including nested arrays)
       const jsonMatch = cleaned.match(/\[[\s\S]*\]/);
       if (jsonMatch) {
         const jsonStr = jsonMatch[0];
@@ -394,10 +362,10 @@ ${filesDescription}`;
           // and merge them into the existing file
           console.log(`(log) [PW-Generate] AI returned full file for existing spec — extracting new tests only`);
           const newTestBlocks = extractTestBlocks(content);
-          const existingTestNames = extractTestNames(existingFull);
+          const existingTestNamesList = extractTestNames(existingFull);
           // Filter to only genuinely new tests
           const uniqueNewTests = newTestBlocks.filter(
-            block => !existingTestNames.some(name => block.includes(name))
+            block => !existingTestNamesList.some(name => block.includes(name))
           );
           if (uniqueNewTests.length === 0) {
             console.log(`(log) [PW-Generate] No new tests to add to ${filePath} — all already exist`);
@@ -491,7 +459,6 @@ ${filesDescription}`;
 
 /**
  * Extract method signatures from an Actions class file.
- * Returns array of strings like "async goToDashboard()" or "async goToTab(tabName: string, buttonName: string)"
  */
 function extractMethodSignatures(content) {
   const methods = [];
@@ -500,7 +467,6 @@ function extractMethodSignatures(content) {
   while ((match = methodPattern.exec(content)) !== null) {
     const name = match[1];
     const params = match[2].trim();
-    // Skip constructor
     if (name === "constructor") continue;
     methods.push(`async ${name}(${params})`);
   }
@@ -509,7 +475,6 @@ function extractMethodSignatures(content) {
 
 /**
  * Extract registered action names from the actionsFixture.ts file.
- * Returns array of strings like "actions.pulse", "actions.dashboard", etc.
  */
 function extractFixtureActions(content) {
   const actions = [];
@@ -524,22 +489,31 @@ function extractFixtureActions(content) {
 /**
  * Extract individual test() blocks from a spec file string.
  * Returns an array of strings, each being a complete test(...) block.
+ *
+ * Strategy: find `test(`, then find the `=> {` that starts the function body,
+ * and only then start counting braces to find the matching `}`.
+ * This avoids being tripped up by destructured params like `({ actions })`.
  */
-function extractTestBlocks(content) {
+export function extractTestBlocks(content) {
   const blocks = [];
   const testPattern = /^[ \t]*test\s*\(/gm;
   let match;
   while ((match = testPattern.exec(content)) !== null) {
-    // Find the matching closing brace by counting braces
-    let depth = 0;
-    let started = false;
-    let end = match.index;
-    for (let i = match.index; i < content.length; i++) {
-      if (content[i] === "{") { depth++; started = true; }
-      if (content[i] === "}") { depth--; }
-      if (started && depth === 0) {
-        // Include the closing ");"
-        end = Math.min(i + 3, content.length); // });
+    // Find the arrow function body opener: `=> {`
+    const arrowIdx = content.indexOf("=> {", match.index);
+    if (arrowIdx === -1) continue;
+    const bodyStart = content.indexOf("{", arrowIdx + 2);
+    if (bodyStart === -1) continue;
+
+    // Count braces from the body opener
+    let depth = 1; // we've just entered the opening {
+    let end = bodyStart + 1;
+    for (let i = bodyStart + 1; i < content.length; i++) {
+      if (content[i] === "{") depth++;
+      if (content[i] === "}") depth--;
+      if (depth === 0) {
+        // Skip past the closing `});`
+        end = Math.min(i + 3, content.length);
         break;
       }
     }
@@ -550,9 +524,8 @@ function extractTestBlocks(content) {
 
 /**
  * Extract test names (the string inside test('...',)) from a spec file.
- * Returns an array of test name strings.
  */
-function extractTestNames(content) {
+export function extractTestNames(content) {
   const names = [];
   const namePattern = /test\s*\(\s*['"`]([^'"`]+)['"`]/g;
   let match;
@@ -565,9 +538,8 @@ function extractTestNames(content) {
 /**
  * Sanitize control characters (newlines, tabs) ONLY inside JSON string values.
  * Walks the string character by character, tracking whether we're inside a quoted string.
- * Structural whitespace (between keys/values) is left untouched.
  */
-function sanitizeJsonStringValues(jsonStr) {
+export function sanitizeJsonStringValues(jsonStr) {
   let result = "";
   let inString = false;
   let escaped = false;
@@ -576,7 +548,6 @@ function sanitizeJsonStringValues(jsonStr) {
     const ch = jsonStr[i];
 
     if (escaped) {
-      // Previous char was a backslash inside a string — pass through as-is
       result += ch;
       escaped = false;
       continue;
@@ -596,7 +567,6 @@ function sanitizeJsonStringValues(jsonStr) {
       } else if (ch === "\t") {
         result += "\\t";
       } else if (ch.charCodeAt(0) < 0x20) {
-        // Other control characters — strip them
         continue;
       } else {
         result += ch;

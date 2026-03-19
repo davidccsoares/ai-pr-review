@@ -30,7 +30,8 @@
       "Bash(echo \"=== Deploying gateway ===\" && npm run deploy 2>&1)",
       "Bash(npm test:*)",
       "Bash(npm install:*)",
-      "Bash(python3:*)"
+      "Bash(python3:*)",
+      "Bash(npm run:*)"
     ]
   }
 }

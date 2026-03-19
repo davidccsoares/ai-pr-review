@@ -26,27 +26,15 @@
 	],
 	// Smart Placement — run the worker closer to Azure DevOps backend
 	// https://developers.cloudflare.com/workers/configuration/smart-placement/
-	"placement": { "mode": "smart" }
-	/**
-	 * Bindings
-	 * Bindings allow your Worker to interact with resources on the Cloudflare Developer Platform, including
-	 * databases, object storage, AI inference, real-time communication and more.
-	 * https://developers.cloudflare.com/workers/runtime-apis/bindings/
-	 */
-	/**
-	 * Environment Variables
-	 * https://developers.cloudflare.com/workers/wrangler/configuration/#environment-variables
-	 * Note: Use secrets to store sensitive data.
-	 * https://developers.cloudflare.com/workers/configuration/secrets/
-	 */
-	// "vars": {  "MY_VARIABLE": "production_value" }
-	/**
-	 * Static Assets
-	 * https://developers.cloudflare.com/workers/static-assets/binding/
-	 */
-	// "assets": {  "directory": "./public/",  "binding": "ASSETS" }
-	/**
-	 * Service Bindings (communicate between multiple Workers)
-	 * https://developers.cloudflare.com/workers/wrangler/configuration/#service-bindings
-	 */
+	"placement": { "mode": "smart" },
+	// ─── Environment Variables ─────────────────────────────────────────────
+	// Shared config extracted from hardcoded values.
+	// AZURE_TOKEN and WEBHOOK_SECRET should be set as secrets:
+	//   npx wrangler secret put AZURE_TOKEN
+	//   npx wrangler secret put WEBHOOK_SECRET
+	"vars": {
+		"AZURE_ORG": "https://dev.azure.com/bindtuning",
+		"PLAYWRIGHT_REPO_NAME": "BindTuning.AdminApp",
+		"PLAYWRIGHT_TARGET_BRANCH": "refs/heads/Dev"
+	}
 }
