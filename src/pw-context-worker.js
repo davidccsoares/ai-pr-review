@@ -16,6 +16,7 @@
 import { orgUrl, azureHeaders, AZURE_API_VERSION } from "./lib/azure.js";
 import { postComment } from "./lib/comments.js";
 import { fetchWithTimeout } from "./lib/fetch.js";
+import { fetchWithRetry } from "./lib/fetch.js";
 import { PLAYWRIGHT_TEST_BRANCH } from "./lib/constants.js";
 
 // ─── Config ──────────────────────────────────────────────────────────────────
@@ -404,7 +405,7 @@ async function fetchMdDocs(project, repoId, headers, env) {
 
       // Cache miss or KV unavailable — fetch from Azure
       const contentUrl = `${ORG}/${project}/_apis/git/repositories/${repoId}/items?path=${encodeURIComponent(docPath)}&versionDescriptor.version=${encodeURIComponent(PLAYWRIGHT_TEST_BRANCH)}&versionDescriptor.versionType=branch&includeContent=true&api-version=${AZURE_API_VERSION}`;
-      const contentRes = await fetchWithTimeout(contentUrl, { headers });
+      const contentRes = await fetchWithRetry(contentUrl, { headers, retries: 2, tag: "PW-Context" });
       if (!contentRes.ok) {
         console.log(`(log) [PW-Context] Could not fetch ${docPath}: ${contentRes.status}`);
         return null;
@@ -451,7 +452,7 @@ async function fetchExistingTestFiles(project, repoId, componentFiles, headers, 
   const results = await Promise.allSettled(
     pathsToCheck.map(async (filePath) => {
       const contentUrl = `${ORG}/${project}/_apis/git/repositories/${repoId}/items?path=${encodeURIComponent(filePath)}&versionDescriptor.version=${encodeURIComponent(PLAYWRIGHT_TEST_BRANCH)}&versionDescriptor.versionType=branch&includeContent=true&api-version=${AZURE_API_VERSION}`;
-      const contentRes = await fetchWithTimeout(contentUrl, { headers });
+      const contentRes = await fetchWithRetry(contentUrl, { headers, retries: 2, tag: "PW-Context" });
       if (!contentRes.ok) return null;
       const fullContent = await contentRes.text();
 

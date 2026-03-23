@@ -13,6 +13,7 @@
 
 import { azureHeaders, orgUrl, AZURE_API_VERSION } from "./lib/azure.js";
 import { fetchWithTimeout } from "./lib/fetch.js";
+import { fetchWithRetry } from "./lib/fetch.js";
 
 /** 14 days in seconds */
 const TTL_14_DAYS = 1_209_600;
@@ -89,7 +90,7 @@ async function ingestBuild(buildId, env) {
       `?buildUri=vstfs:///Build/Build/${buildId}` +
       `&api-version=${AZURE_API_VERSION}`;
 
-    const runsRes = await fetchWithTimeout(runsUrl, { headers, timeout: 15_000 });
+    const runsRes = await fetchWithRetry(runsUrl, { headers, timeout: 15_000, retries: 3, tag: "FlakyDetective" });
     if (!runsRes.ok) {
       console.error(`(log) [FlakyDetective] Failed to fetch test runs: ${runsRes.status}`);
       return;
@@ -105,11 +106,15 @@ async function ingestBuild(buildId, env) {
 
     console.log(`(log) [FlakyDetective] Found ${testRuns.length} test run(s) for build ${buildId}`);
 
-    // 2. Fetch all test results across all runs
+    // 2. Fetch all test results across all runs (in parallel)
+    const resultsBatches = await Promise.allSettled(
+      testRuns.map(run => fetchTestResults(ORG, project, run.id, headers))
+    );
     const allResults = [];
-    for (const run of testRuns) {
-      const results = await fetchTestResults(ORG, project, run.id, headers);
-      allResults.push(...results);
+    for (const batch of resultsBatches) {
+      if (batch.status === "fulfilled") {
+        allResults.push(...batch.value);
+      }
     }
 
     console.log(`(log) [FlakyDetective] Fetched ${allResults.length} total test result(s)`);
@@ -167,7 +172,7 @@ async function fetchTestResults(orgUrl, project, runId, headers) {
       `${orgUrl}/${project}/_apis/test/runs/${runId}/results` +
       `?api-version=${AZURE_API_VERSION}&$top=${top}&$skip=${skip}`;
 
-    const res = await fetchWithTimeout(url, { headers, timeout: 15_000 });
+    const res = await fetchWithRetry(url, { headers, timeout: 15_000, retries: 3, tag: "FlakyDetective" });
     if (!res.ok) {
       console.error(`(log) [FlakyDetective] Failed to fetch results for run ${runId}: ${res.status}`);
       break;

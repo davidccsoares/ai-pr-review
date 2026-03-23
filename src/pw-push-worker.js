@@ -16,6 +16,7 @@
 import { orgUrl, azureHeaders, AZURE_API_VERSION } from "./lib/azure.js";
 import { postComment } from "./lib/comments.js";
 import { fetchWithTimeout } from "./lib/fetch.js";
+import { fetchWithRetry } from "./lib/fetch.js";
 import { PLAYWRIGHT_TEST_BRANCH } from "./lib/constants.js";
 
 export default {
@@ -107,7 +108,7 @@ async function pushTests(project, repoId, generatedTests, prId, headers, env) {
   try {
     // 1. Get the branch tip ref
     const refsUrl = `${ORG}/${project}/_apis/git/repositories/${repoId}/refs?filter=heads/${PLAYWRIGHT_TEST_BRANCH}&api-version=${AZURE_API_VERSION}`;
-    const refsRes = await fetchWithTimeout(refsUrl, { headers });
+    const refsRes = await fetchWithRetry(refsUrl, { headers, retries: 3, tag: "PW-Push" });
 
     if (!refsRes.ok) {
       console.error(`(log) [PW-Push] Failed to get branch ref: ${refsRes.status}`);
@@ -165,11 +166,13 @@ async function pushTests(project, repoId, generatedTests, prId, headers, env) {
       ],
     };
 
-    const pushRes = await fetchWithTimeout(pushUrl, {
+    const pushRes = await fetchWithRetry(pushUrl, {
       method: "POST",
       headers: { ...headers, "Content-Type": "application/json" },
       body: JSON.stringify(pushBody),
       timeout: 15_000,
+      retries: 3,
+      tag: "PW-Push",
     });
 
     if (pushRes.ok) {
@@ -202,10 +205,12 @@ async function triggerPipeline(project, headers, env, pipelineId) {
       },
     };
 
-    const res = await fetchWithTimeout(pipelineUrl, {
+    const res = await fetchWithRetry(pipelineUrl, {
       method: "POST",
       headers: { ...headers, "Content-Type": "application/json" },
       body: JSON.stringify(pipelineBody),
+      retries: 2,
+      tag: "PW-Push",
     });
 
     if (res.ok) {

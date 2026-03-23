@@ -3,9 +3,11 @@
  */
 
 import { orgUrl, AZURE_API_VERSION } from "./azure.js";
+import { fetchWithRetry } from "./fetch.js";
 
 /**
  * Post a comment thread on an Azure DevOps pull request.
+ * Uses retry with backoff for transient Azure failures.
  * @param {object} env – Worker env bindings
  * @param {string} project
  * @param {string} repoId
@@ -28,11 +30,13 @@ export async function postComment(env, project, repoId, prId, headers, content, 
   };
 
   try {
-    const res = await fetch(threadUrl, {
+    const res = await fetchWithRetry(threadUrl, {
       method: "POST",
       headers: { ...headers, "Content-Type": "application/json" },
       body: JSON.stringify(payload),
-      signal: AbortSignal.timeout(10_000),
+      timeout: 10_000,
+      retries: 3,
+      tag,
     });
 
     if (res.ok) {

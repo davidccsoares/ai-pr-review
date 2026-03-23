@@ -1,5 +1,6 @@
 import { orgUrl, AZURE_API_VERSION, azureHeaders as buildAzureHeaders } from "./lib/azure.js";
 import { fetchWithTimeout } from "./lib/fetch.js";
+import { fetchWithRetry } from "./lib/fetch.js";
 import { MAX_BATCH_FILES } from "./lib/constants.js";
 import { NEURON_DAILY_LIMIT } from "./lib/neurons.js";
 
@@ -308,7 +309,7 @@ function buildNeuronsHtml({ today, pct, usage, hourly, totalWebhooksToday, maxUs
 
   <footer>
     Limit: ${NEURON_DAILY_LIMIT.toLocaleString()} neurons/day (Cloudflare free tier: 10,000 with 2K safety buffer)
-    &bull; Data retained for 24 hours
+    &bull; Data retained for 14 days
   </footer>
 </body>
 </html>`;
@@ -342,7 +343,7 @@ async function fetchLinkedWorkItems(env, project, repoId, prId, headers) {
   try {
     // 1. Get work item refs linked to the PR
     const refsUrl = `${ORG}/${project}/_apis/git/repositories/${repoId}/pullRequests/${prId}/workitems?api-version=${AZURE_API_VERSION}`;
-    const refsRes = await fetchWithTimeout(refsUrl, { headers });
+    const refsRes = await fetchWithRetry(refsUrl, { headers, retries: 2, tag: "Gateway" });
     if (!refsRes.ok) {
       console.log("(log) [Gateway] Could not fetch PR work item refs:", refsRes.status);
       return [];
@@ -354,7 +355,7 @@ async function fetchLinkedWorkItems(env, project, repoId, prId, headers) {
     // 2. Batch-fetch full work item details (with relations so we can find parents)
     const ids = refs.map((r) => r.id).join(",");
     const wiUrl = `${ORG}/${project}/_apis/wit/workitems?ids=${ids}&$expand=relations&api-version=${AZURE_API_VERSION}`;
-    const wiRes = await fetchWithTimeout(wiUrl, { headers });
+    const wiRes = await fetchWithRetry(wiUrl, { headers, retries: 2, tag: "Gateway" });
     if (!wiRes.ok) {
       console.log("(log) [Gateway] Could not fetch work item details:", wiRes.status);
       return [];
@@ -391,7 +392,7 @@ async function fetchLinkedWorkItems(env, project, repoId, prId, headers) {
     if (parentIds.size > 0) {
       const parentIdsStr = [...parentIds].join(",");
       const parentUrl = `${ORG}/${project}/_apis/wit/workitems?ids=${parentIdsStr}&api-version=${AZURE_API_VERSION}`;
-      const parentRes = await fetchWithTimeout(parentUrl, { headers });
+      const parentRes = await fetchWithRetry(parentUrl, { headers, retries: 2, tag: "Gateway" });
       if (parentRes.ok) {
         const parentData = await parentRes.json();
         for (const pw of parentData.value || []) {
@@ -764,7 +765,7 @@ async function processReview(payload, env) {
 
     // 1. Get latest iteration (1 subrequest)
     const iterUrl = `${ORG}/${project}/_apis/git/repositories/${repoId}/pullRequests/${prId}/iterations?api-version=${AZURE_API_VERSION}`;
-    const iterRes = await fetchWithTimeout(iterUrl, { headers });
+    const iterRes = await fetchWithRetry(iterUrl, { headers, retries: 2, tag: "Gateway" });
     if (!iterRes.ok) {
       console.error("(log) [Gateway] Failed to fetch iterations:", iterRes.status);
       return;
@@ -774,7 +775,7 @@ async function processReview(payload, env) {
 
     // 2. Get changed files (1 subrequest)
     const changesUrl = `${ORG}/${project}/_apis/git/repositories/${repoId}/pullRequests/${prId}/iterations/${latestIteration}/changes?api-version=${AZURE_API_VERSION}`;
-    const changesRes = await fetchWithTimeout(changesUrl, { headers });
+    const changesRes = await fetchWithRetry(changesUrl, { headers, retries: 2, tag: "Gateway" });
     if (!changesRes.ok) {
       console.error("(log) [Gateway] Failed to fetch changes:", changesRes.status);
       return;

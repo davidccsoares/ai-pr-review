@@ -8,7 +8,10 @@ export const CF_AI_MODEL = "@cf/mistralai/mistral-small-3.1-24b-instruct";
 export const CF_AI_MODEL_CHEAP = "@cf/meta/llama-3.2-3b-instruct";
 
 // ─── Batching ───────────────────────────────────────────────────────────────
-export const MAX_BATCH_FILES = 40;
+// Workers have a 50 subrequest limit. Each batch uses:
+//   1 filediffs API call + N file fetches + retries overhead
+// 30 files keeps us safely under 50 even with retries.
+export const MAX_BATCH_FILES = 30;
 
 // ─── Playwright Branch ──────────────────────────────────────────────────────
 export const PLAYWRIGHT_TEST_BRANCH = "internship/playwright-unit-tests";
