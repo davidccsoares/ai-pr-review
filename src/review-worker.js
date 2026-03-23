@@ -1,6 +1,7 @@
 import { orgUrl, azureHeaders, AZURE_API_VERSION, AZURE_API_VERSION_FILEDIFFS, fetchFileAtCommit } from "./lib/azure.js";
 import { checkNeuronBudget, recordNeuronUsage, NEURON_DAILY_LIMIT } from "./lib/neurons.js";
 import { fetchWithTimeout } from "./lib/fetch.js";
+import { fetchWithRetry } from "./lib/fetch.js";
 import { computeDiff, truncateDiffAtHunkBoundary, CONTEXT_LINES } from "./lib/diffs.js";
 import { scanForSecrets, SECRET_PATTERNS } from "./lib/secrets.js";
 import { buildDiffBlock, aiReviewBatch } from "./lib/prompts.js";
@@ -96,7 +97,7 @@ async function fetchAndDiffFiles(files, project, repoId, sourceCommit, targetCom
   let fileDiffsData = [];
   try {
     console.log(`(log) [Review] Calling filediffs API: base=${targetCommit} target=${sourceCommit} for ${files.length} files`);
-    const fileDiffsRes = await fetchWithTimeout(fileDiffsUrl, {
+    const fileDiffsRes = await fetchWithRetry(fileDiffsUrl, {
       method: "POST",
       headers: { ...headers, "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -105,6 +106,8 @@ async function fetchAndDiffFiles(files, project, repoId, sourceCommit, targetCom
         fileDiffParams,
       }),
       timeout: 15_000,
+      retries: 3,
+      tag: "Review",
     });
 
     if (fileDiffsRes.ok) {
@@ -459,10 +462,12 @@ ${backlogContext || ""}`;
     status: 4,
   };
 
-  const summaryRes = await fetchWithTimeout(threadBaseUrl, {
+  const summaryRes = await fetchWithRetry(threadBaseUrl, {
     method: "POST",
     headers: { ...headers, "Content-Type": "application/json" },
     body: JSON.stringify(summaryBody),
+    retries: 3,
+    tag: "Review",
   });
 
   if (summaryRes.ok) {
