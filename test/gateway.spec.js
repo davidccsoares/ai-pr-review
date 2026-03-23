@@ -184,9 +184,9 @@ describe('computePrLabels', () => {
     expect(labels).toEqual(['docs-only']);
   });
 
-  it('returns empty array when no files at all', () => {
+  it('returns only needs-backlog when no files and no work items', () => {
     const labels = computePrLabels({ skip: [], high: [], low: [] });
-    expect(labels).toEqual([]);
+    expect(labels).toEqual(['needs-backlog']);
   });
 
   it('adds large-pr label for 15+ reviewable files', () => {
@@ -232,6 +232,46 @@ describe('computePrLabels', () => {
     });
     expect(labels).toContain('backend');
     expect(labels).toContain('frontend');
+  });
+
+  it('adds tests-only when all reviewable files are test/spec files', () => {
+    const labels = computePrLabels({
+      skip: [],
+      high: [],
+      low: [
+        { path: '/tests/homepage.spec.ts' },
+        { path: '/tests/components/pulse/pulse.spec.ts' },
+      ],
+    });
+    expect(labels).toContain('tests-only');
+    expect(labels).not.toContain('frontend');
+  });
+
+  it('does not add tests-only when production files are also changed', () => {
+    const labels = computePrLabels({
+      skip: [],
+      high: [{ path: '/src/app/dashboard.component.ts' }],
+      low: [{ path: '/tests/dashboard.spec.ts' }],
+    });
+    expect(labels).not.toContain('tests-only');
+  });
+
+  it('adds needs-backlog when workItems is empty', () => {
+    const labels = computePrLabels({
+      skip: [],
+      high: [{ path: '/src/app/dashboard.component.ts' }],
+      low: [],
+    }, []);
+    expect(labels).toContain('needs-backlog');
+  });
+
+  it('does not add needs-backlog when workItems are present', () => {
+    const labels = computePrLabels({
+      skip: [],
+      high: [{ path: '/src/app/dashboard.component.ts' }],
+      low: [],
+    }, [{ id: 123, type: 'Task', title: 'Some task' }]);
+    expect(labels).not.toContain('needs-backlog');
   });
 });
 

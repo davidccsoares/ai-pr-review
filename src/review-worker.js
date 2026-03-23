@@ -1,14 +1,14 @@
 import { orgUrl, azureHeaders, AZURE_API_VERSION, AZURE_API_VERSION_FILEDIFFS, fetchFileAtCommit } from "./lib/azure.js";
 import { checkNeuronBudget, recordNeuronUsage, NEURON_DAILY_LIMIT } from "./lib/neurons.js";
 import { fetchWithTimeout } from "./lib/fetch.js";
-import { computeDiff, truncateDiffAtHunkBoundary } from "./lib/diffs.js";
+import { computeDiff, truncateDiffAtHunkBoundary, CONTEXT_LINES } from "./lib/diffs.js";
 import { scanForSecrets, SECRET_PATTERNS } from "./lib/secrets.js";
 import { buildDiffBlock, aiReviewBatch } from "./lib/prompts.js";
 import { MAX_BATCH_FILES, CF_AI_MODEL_CHEAP } from "./lib/constants.js";
 
 // Re-export lib functions so existing consumers (tests, other workers) can still
 // import them from review-worker.js without changing their import paths.
-export { computeDiff, truncateDiffAtHunkBoundary } from "./lib/diffs.js";
+export { computeDiff, truncateDiffAtHunkBoundary, CONTEXT_LINES } from "./lib/diffs.js";
 export { scanForSecrets, SECRET_PATTERNS } from "./lib/secrets.js";
 
 const MAX_FILE_DIFF = 12000;
@@ -140,11 +140,20 @@ async function fetchAndDiffFiles(files, project, repoId, sourceCommit, targetCom
     }
   }
 
-  // 2. For each file, fetch new content and build diff using Azure's line ranges
-  for (const f of files) {
-    console.log(`(log) [Review] Processing file (${f.isAdd ? "add" : "edit"}): ${f.path}`);
+  // 2. Fetch all file contents in parallel, then build diffs
+  console.log(`(log) [Review] Fetching ${files.length} file contents in parallel`);
+  const contentResults = await Promise.allSettled(
+    files.map(async (f) => {
+      const content = await fetchFileAtCommit(env, project, repoId, f.path, sourceCommit, headers);
+      return { file: f, content };
+    })
+  );
 
-    const newContent = await fetchFileAtCommit(env, project, repoId, f.path, sourceCommit, headers);
+  for (const result of contentResults) {
+    if (result.status !== "fulfilled") continue;
+    const { file: f, content: newContent } = result.value;
+
+    console.log(`(log) [Review] Processing file (${f.isAdd ? "add" : "edit"}): ${f.path}`);
 
     if (newContent === null) {
       console.log("(log) [Review] Skipping (could not fetch):", f.path);
@@ -380,6 +389,14 @@ ${backlogContext || ""}`;
       summary.push(`- **${f.pattern}** found in \`${fileName}\` at line ${f.line}`);
     }
     summary.push(``);
+
+    // Apply security-alert label to the PR (fire-and-forget)
+    const labelUrl = `${ORG}/${project}/_apis/git/repositories/${repoId}/pullRequests/${prId}/labels?api-version=${AZURE_API_VERSION}`;
+    fetchWithTimeout(labelUrl, {
+      method: "POST",
+      headers: { ...headers, "Content-Type": "application/json" },
+      body: JSON.stringify({ name: "security-alert" }),
+    }).catch(e => console.log("(log) [Review] security-alert label error:", e.message));
   }
 
   if (workItems.length > 0) {

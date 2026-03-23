@@ -1,6 +1,7 @@
 import { orgUrl, AZURE_API_VERSION, azureHeaders as buildAzureHeaders } from "./lib/azure.js";
 import { fetchWithTimeout } from "./lib/fetch.js";
 import { MAX_BATCH_FILES } from "./lib/constants.js";
+import { NEURON_DAILY_LIMIT } from "./lib/neurons.js";
 
 const MAX_BACKLOG_SIZE = 3000;
 const MAX_WEBHOOKS_PER_HOUR = 30;
@@ -9,8 +10,14 @@ const STARTUP_TIME = Date.now();
 
 export default {
   async fetch(request, env, ctx) {
-    // ── Health endpoint ──────────────────────────────────────────────────
+    const url = new URL(request.url);
+
+    // ── GET routes ───────────────────────────────────────────────────────
     if (request.method === "GET") {
+      if (url.pathname === "/neurons") {
+        return handleNeuronsDashboard(env);
+      }
+      // Default: health check
       return Response.json({
         status: "ok",
         worker: "ai-pr-review-gateway",
@@ -59,6 +66,253 @@ export default {
     return new Response("Accepted", { status: 202 });
   },
 };
+
+// ─── Neuron Usage Dashboard ──────────────────────────────────────────────────
+
+async function handleNeuronsDashboard(env) {
+  if (!env?.BOT_KV) {
+    return new Response("KV not configured", { status: 503 });
+  }
+
+  // Fetch last 14 days of neuron usage
+  const days = [];
+  const now = new Date();
+  for (let i = 0; i < 14; i++) {
+    const d = new Date(now);
+    d.setDate(d.getDate() - i);
+    const dateStr = d.toISOString().slice(0, 10);
+    days.push(dateStr);
+  }
+
+  const usageResults = await Promise.allSettled(
+    days.map(async (dateStr) => {
+      const raw = await env.BOT_KV.get(`neurons:${dateStr}`);
+      return { date: dateStr, used: parseInt(raw || "0", 10) };
+    })
+  );
+
+  const usage = usageResults
+    .filter(r => r.status === "fulfilled")
+    .map(r => r.value);
+
+  // Fetch today's hourly rate counts
+  const todayStr = now.toISOString().slice(0, 10);
+  const hourlyResults = await Promise.allSettled(
+    Array.from({ length: 24 }, (_, h) => {
+      const hourStr = `${todayStr}T${String(h).padStart(2, "0")}`;
+      return env.BOT_KV.get(`rate:${hourStr}`).then(raw => ({
+        hour: h,
+        webhooks: parseInt(raw || "0", 10),
+      }));
+    })
+  );
+
+  const hourly = hourlyResults
+    .filter(r => r.status === "fulfilled")
+    .map(r => r.value)
+    .filter(h => h.webhooks > 0);
+
+  const today = usage.find(u => u.date === todayStr) || { date: todayStr, used: 0 };
+  const pct = Math.round((today.used / NEURON_DAILY_LIMIT) * 100);
+  const totalWebhooksToday = hourly.reduce((sum, h) => sum + h.webhooks, 0);
+  const maxUsage = Math.max(...usage.map(u => u.used), 1);
+
+  return new Response(buildNeuronsHtml({
+    today, pct, usage, hourly, totalWebhooksToday, maxUsage,
+  }), {
+    headers: {
+      "Content-Type": "text/html; charset=utf-8",
+      "Cache-Control": "no-cache",
+    },
+  });
+}
+
+function buildNeuronsHtml({ today, pct, usage, hourly, totalWebhooksToday, maxUsage }) {
+  const barColor = pct > 90 ? "var(--danger)" : pct > 70 ? "var(--warning)" : "var(--success)";
+
+  const usageRows = usage.map(u => {
+    const barWidth = Math.round((u.used / maxUsage) * 100);
+    const dayPct = Math.round((u.used / NEURON_DAILY_LIMIT) * 100);
+    const isToday = u.date === today.date;
+    return `
+      <tr${isToday ? ' class="today"' : ''}>
+        <td>${u.date}${isToday ? " (today)" : ""}</td>
+        <td class="right">${u.used.toLocaleString()}</td>
+        <td class="right">${dayPct}%</td>
+        <td>
+          <div class="bar-bg"><div class="bar" style="width:${barWidth}%;background:${dayPct > 90 ? "var(--danger)" : dayPct > 70 ? "var(--warning)" : "var(--success)"}"></div></div>
+        </td>
+      </tr>`;
+  }).join("");
+
+  const hourlyRows = hourly.map(h => `
+    <tr>
+      <td class="center">${String(h.hour).padStart(2, "0")}:00</td>
+      <td class="center">${h.webhooks}</td>
+    </tr>`
+  ).join("");
+
+  const avg7d = usage.length >= 7
+    ? Math.round(usage.slice(0, 7).reduce((s, u) => s + u.used, 0) / 7)
+    : 0;
+
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Neuron Usage Dashboard</title>
+<style>
+  :root {
+    --bg: #f8f9fa;
+    --surface: #ffffff;
+    --text: #1a1a2e;
+    --text-secondary: #6c757d;
+    --border: #dee2e6;
+    --accent: #4361ee;
+    --success: #28a745;
+    --warning: #ffc107;
+    --danger: #dc3545;
+    --card-shadow: 0 2px 8px rgba(0,0,0,0.08);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0d1117;
+      --surface: #161b22;
+      --text: #e6edf3;
+      --text-secondary: #8b949e;
+      --border: #30363d;
+      --accent: #58a6ff;
+      --success: #3fb950;
+      --warning: #e3b341;
+      --danger: #f85149;
+      --card-shadow: 0 2px 8px rgba(0,0,0,0.3);
+    }
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    line-height: 1.6;
+    padding: 2rem;
+    max-width: 1000px;
+    margin: 0 auto;
+  }
+  h1 { font-size: 1.8rem; margin-bottom: 0.25rem; }
+  .subtitle { color: var(--text-secondary); font-size: 0.9rem; margin-bottom: 2rem; }
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 1rem; margin-bottom: 2rem; }
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 1.25rem;
+    box-shadow: var(--card-shadow);
+  }
+  .card .label { font-size: 0.8rem; color: var(--text-secondary); text-transform: uppercase; letter-spacing: 0.05em; }
+  .card .value { font-size: 1.8rem; font-weight: 700; margin-top: 0.25rem; }
+  .card .detail { font-size: 0.8rem; color: var(--text-secondary); margin-top: 0.25rem; }
+  .progress-bg {
+    width: 100%;
+    height: 24px;
+    background: var(--border);
+    border-radius: 12px;
+    overflow: hidden;
+    margin-top: 0.5rem;
+  }
+  .progress-fill {
+    height: 100%;
+    border-radius: 12px;
+    transition: width 0.3s;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 0.75rem;
+    font-weight: 600;
+    color: white;
+    min-width: 2rem;
+  }
+  h2 { font-size: 1.3rem; margin: 2rem 0 1rem; }
+  .table-wrap { overflow-x: auto; margin-bottom: 2rem; }
+  table { width: 100%; border-collapse: collapse; background: var(--surface); border-radius: 8px; overflow: hidden; box-shadow: var(--card-shadow); }
+  th { background: var(--border); padding: 0.75rem 1rem; text-align: left; font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.05em; color: var(--text-secondary); }
+  td { padding: 0.6rem 1rem; border-top: 1px solid var(--border); font-size: 0.875rem; }
+  .right { text-align: right; }
+  .center { text-align: center; }
+  .today { background: color-mix(in srgb, var(--accent) 8%, transparent); font-weight: 600; }
+  .bar-bg { width: 100%; height: 16px; background: var(--border); border-radius: 8px; overflow: hidden; }
+  .bar { height: 100%; border-radius: 8px; }
+  tr:hover { background: color-mix(in srgb, var(--accent) 5%, transparent); }
+  .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 2rem; }
+  @media (max-width: 768px) {
+    body { padding: 1rem; }
+    .cards { grid-template-columns: 1fr; }
+    .grid-2 { grid-template-columns: 1fr; }
+  }
+  footer { text-align: center; color: var(--text-secondary); font-size: 0.8rem; margin-top: 3rem; padding-top: 1rem; border-top: 1px solid var(--border); }
+</style>
+</head>
+<body>
+  <h1>&#129504; Neuron Usage Dashboard</h1>
+  <p class="subtitle">AI PR Review Bot &bull; Cloudflare Workers AI</p>
+
+  <div class="cards">
+    <div class="card">
+      <div class="label">Today's Usage</div>
+      <div class="value">${today.used.toLocaleString()}</div>
+      <div class="detail">of ${NEURON_DAILY_LIMIT.toLocaleString()} daily limit</div>
+      <div class="progress-bg">
+        <div class="progress-fill" style="width:${Math.min(pct, 100)}%;background:${barColor}">${pct}%</div>
+      </div>
+    </div>
+    <div class="card">
+      <div class="label">Remaining Today</div>
+      <div class="value">${Math.max(0, NEURON_DAILY_LIMIT - today.used).toLocaleString()}</div>
+      <div class="detail">neurons available</div>
+    </div>
+    <div class="card">
+      <div class="label">7-Day Average</div>
+      <div class="value">${avg7d.toLocaleString()}</div>
+      <div class="detail">neurons / day</div>
+    </div>
+    <div class="card">
+      <div class="label">Webhooks Today</div>
+      <div class="value">${totalWebhooksToday}</div>
+      <div class="detail">PR reviews triggered</div>
+    </div>
+  </div>
+
+  <div class="grid-2">
+    <div>
+      <h2>Daily Usage (14 days)</h2>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Date</th><th>Neurons</th><th>% Used</th><th>Usage</th></tr></thead>
+          <tbody>${usageRows}</tbody>
+        </table>
+      </div>
+    </div>
+    <div>
+      <h2>Today's Webhooks by Hour</h2>
+      <div class="table-wrap">
+      ${hourly.length === 0
+        ? '<div style="text-align:center;padding:2rem;color:var(--text-secondary)">No webhooks today yet.</div>'
+        : `<table>
+          <thead><tr><th>Hour</th><th>Webhooks</th></tr></thead>
+          <tbody>${hourlyRows}</tbody>
+        </table>`
+      }
+      </div>
+    </div>
+  </div>
+
+  <footer>
+    Limit: ${NEURON_DAILY_LIMIT.toLocaleString()} neurons/day (Cloudflare free tier: 10,000 with 2K safety buffer)
+    &bull; Data retained for 24 hours
+  </footer>
+</body>
+</html>`;
+}
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
@@ -358,9 +612,11 @@ const FRONTEND_PATTERN = /\.(ts|tsx|js|jsx|vue|svelte|component\.html)$/i;
 
 /**
  * Compute PR labels based on file classification (zero subrequests — pure logic).
- * Returns an array of label strings.
+ * @param {object} classified - { skip, high, low } from classifyFiles()
+ * @param {Array} [workItems=[]] - Linked work items from fetchLinkedWorkItems()
+ * @returns {string[]} Label names to apply
  */
-export function computePrLabels(classified) {
+export function computePrLabels(classified, workItems = []) {
   const labels = [];
   const allReviewable = [...classified.high, ...classified.low];
 
@@ -368,6 +624,11 @@ export function computePrLabels(classified) {
   if (allReviewable.length === 0 && classified.skip.length > 0) {
     labels.push("docs-only");
     return labels;
+  }
+
+  // tests-only: every reviewable file is a test/spec file
+  if (allReviewable.length > 0 && allReviewable.every(f => LOW_EXTENSIONS.test(f.path) || LOW_PATHS.test(f.path))) {
+    labels.push("tests-only");
   }
 
   // large-pr: 15+ reviewable files
@@ -380,11 +641,18 @@ export function computePrLabels(classified) {
     labels.push("high-risk");
   }
 
-  // frontend / backend detection
-  const hasBackend = allReviewable.some(f => BACKEND_PATTERN.test(f.path));
-  const hasFrontend = allReviewable.some(f => FRONTEND_PATTERN.test(f.path));
-  if (hasBackend) labels.push("backend");
-  if (hasFrontend) labels.push("frontend");
+  // needs-backlog: no linked work items
+  if (workItems.length === 0) {
+    labels.push("needs-backlog");
+  }
+
+  // frontend / backend detection (skip if tests-only — test file extensions would false-positive)
+  if (!labels.includes("tests-only")) {
+    const hasBackend = allReviewable.some(f => BACKEND_PATTERN.test(f.path));
+    const hasFrontend = allReviewable.some(f => FRONTEND_PATTERN.test(f.path));
+    if (hasBackend) labels.push("backend");
+    if (hasFrontend) labels.push("frontend");
+  }
 
   return labels;
 }
@@ -524,7 +792,7 @@ async function processReview(payload, env) {
     console.log(`(log) [Gateway] Classification: ${classified.high.length} HIGH, ${classified.low.length} LOW, ${classified.skip.length} SKIP`);
 
     // 4b. Auto-tag PR with labels based on classification (fire-and-forget)
-    const prLabels = computePrLabels(classified);
+    const prLabels = computePrLabels(classified, workItems);
     if (prLabels.length > 0) {
       applyPrLabels(env, project, repoId, prId, prLabels, headers)
         .catch(e => console.log("(log) [Gateway] Label apply error:", e.message));

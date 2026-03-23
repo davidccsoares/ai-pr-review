@@ -10,7 +10,7 @@
 // Cloudflare Workers AI: 10,000 neurons/day (account-wide)
 // Mistral Small 3.1 24B: ~31,876 neurons/M input tokens, ~50,488 neurons/M output tokens
 // Llama 3.2 3B: much cheaper (~1/4 the cost)
-export const NEURON_DAILY_LIMIT = 10000; // Free tier cap; paid plan allows overage at $0.011/1K neurons
+export const NEURON_DAILY_LIMIT = 8000; // Free tier is 10K; buffer 2K for KV eventual-consistency races
 export const NEURONS_PER_INPUT_CHAR = 31876 / 4_000_000; // ~4 chars/token, per 1M tokens
 export const NEURONS_PER_OUTPUT_CHAR = 50488 / 4_000_000;
 
@@ -51,7 +51,7 @@ export async function recordNeuronUsage(env, inputChars, outputChars, tag = "") 
       outputChars * NEURONS_PER_OUTPUT_CHAR
     );
     const newTotal = current + estimated;
-    await env.BOT_KV.put(key, String(newTotal), { expirationTtl: 86400 });
+    await env.BOT_KV.put(key, String(newTotal), { expirationTtl: 1_209_600 }); // 14 days
     console.log(`(log) [${tag}] Neurons: +${estimated} (total today: ${newTotal})`);
   } catch (e) {
     console.log(`(log) [${tag}] KV write error (neuron record):`, e.message);

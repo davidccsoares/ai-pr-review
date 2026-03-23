@@ -8,7 +8,7 @@
  *  - dry-run tests     (validates diff logic)
  */
 
-const CONTEXT_LINES = 10;
+export const CONTEXT_LINES = 10;
 
 // ─── Myers Diff ─────────────────────────────────────────────────────────────
 
