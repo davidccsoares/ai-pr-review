@@ -13,15 +13,15 @@
  * Subrequest budget: ~14 (POST) / ~25 (/test)
  */
 
-import { orgUrl, AZURE_API_VERSION } from "./lib/azure.js";
+import { orgUrl, azureHeaders, AZURE_API_VERSION } from "./lib/azure.js";
 import { postComment } from "./lib/comments.js";
 import { fetchWithTimeout } from "./lib/fetch.js";
+import { PLAYWRIGHT_TEST_BRANCH } from "./lib/constants.js";
 
 // ─── Config ──────────────────────────────────────────────────────────────────
 const PLAYWRIGHT_REPO_NAME = "BindTuning.AdminApp";
 const PLAYWRIGHT_TARGET_BRANCH = "refs/heads/Dev";
 const PLAYWRIGHT_PROJECT = "BindTuning";
-const PLAYWRIGHT_TEST_BRANCH = "internship/playwright-unit-tests";
 const MAX_MD_CHARS = 24000;
 const MAX_COMPONENT_FILES = 10;
 
@@ -80,16 +80,14 @@ export default {
 
 async function handleTest(env, ctx, dryRun = false) {
   const ORG = orgUrl(env);
-  const azureHeaders = {
-    Authorization: `Basic ${btoa(":" + env.AZURE_TOKEN)}`,
-  };
+  const headers = azureHeaders(env.AZURE_TOKEN);
 
   console.log("(log) [Test] /test endpoint hit");
 
   try {
     // Find the AdminApp repo
     const repoUrl = `${ORG}/${PLAYWRIGHT_PROJECT}/_apis/git/repositories/${PLAYWRIGHT_REPO_NAME}?api-version=${AZURE_API_VERSION}`;
-    const repoRes = await fetchWithTimeout(repoUrl, { headers: azureHeaders });
+    const repoRes = await fetchWithTimeout(repoUrl, { headers });
 
     let repoId = null;
     if (repoRes.ok) {
@@ -104,7 +102,7 @@ async function handleTest(env, ctx, dryRun = false) {
     let realPr = null;
     if (repoId) {
       const prListUrl = `${ORG}/${PLAYWRIGHT_PROJECT}/_apis/git/repositories/${repoId}/pullrequests?searchCriteria.status=active&searchCriteria.targetRefName=refs/heads/Dev&$top=1&api-version=${AZURE_API_VERSION}`;
-      const prListRes = await fetchWithTimeout(prListUrl, { headers: azureHeaders });
+      const prListRes = await fetchWithTimeout(prListUrl, { headers });
       if (prListRes.ok) {
         const prListData = await prListRes.json();
         realPr = (prListData.value || [])[0] || null;
@@ -127,7 +125,7 @@ async function handleTest(env, ctx, dryRun = false) {
 
       // Get changed files from the PR's latest iteration
       const iterUrl = `${ORG}/${PLAYWRIGHT_PROJECT}/_apis/git/repositories/${repoId}/pullRequests/${prId}/iterations?api-version=${AZURE_API_VERSION}`;
-      const iterRes = await fetchWithTimeout(iterUrl, { headers: azureHeaders });
+      const iterRes = await fetchWithTimeout(iterUrl, { headers });
       if (!iterRes.ok) {
         return new Response(`Failed to fetch PR iterations: ${iterRes.status}`, { status: 500 });
       }
@@ -135,7 +133,7 @@ async function handleTest(env, ctx, dryRun = false) {
       const latestIteration = Math.max(...iterData.value.map((i) => i.id));
 
       const changesUrl = `${ORG}/${PLAYWRIGHT_PROJECT}/_apis/git/repositories/${repoId}/pullRequests/${prId}/iterations/${latestIteration}/changes?api-version=${AZURE_API_VERSION}`;
-      const changesRes = await fetchWithTimeout(changesUrl, { headers: azureHeaders });
+      const changesRes = await fetchWithTimeout(changesUrl, { headers });
       if (!changesRes.ok) {
         return new Response(`Failed to fetch PR changes: ${changesRes.status}`, { status: 500 });
       }
@@ -154,7 +152,7 @@ async function handleTest(env, ctx, dryRun = false) {
           const ct = typeof e.changeType === "string" ? e.changeType.toLowerCase() : e.changeType;
           const isAdd = ct === "add" || ct === 1;
           const fileUrl = `${ORG}/${PLAYWRIGHT_PROJECT}/_apis/git/repositories/${repoId}/items?path=${encodeURIComponent(e.item.path)}&versionDescriptor.version=${sourceCommit}&versionDescriptor.versionType=commit&includeContent=true&api-version=${AZURE_API_VERSION}`;
-          const fileRes = await fetchWithTimeout(fileUrl, { headers: azureHeaders });
+          const fileRes = await fetchWithTimeout(fileUrl, { headers });
           if (!fileRes.ok) return null;
           const content = await fileRes.text();
           const lines = content.split("\n").slice(0, 80);
@@ -248,9 +246,7 @@ async function handleTest(env, ctx, dryRun = false) {
 
 async function runTestGeneration(payload, env) {
   const { prId, repoId, project, prTitle, fileChanges, azureToken, dryRun } = payload;
-  const azureHeaders = {
-    Authorization: `Basic ${btoa(":" + (azureToken || env.AZURE_TOKEN))}`,
-  };
+  const headers = azureHeaders(azureToken || env.AZURE_TOKEN);
 
   try {
     console.log(`(log) [PW-Context] Starting test generation for PR #${prId}${dryRun ? " (DRY RUN)" : ""}`);
@@ -265,8 +261,8 @@ async function runTestGeneration(payload, env) {
 
     // 2. Fetch docs and existing test files in parallel (independent operations)
     const [mdDocs, existingFiles] = await Promise.all([
-      fetchMdDocs(project, repoId, azureHeaders, env),
-      fetchExistingTestFiles(project, repoId, componentFiles, azureHeaders, env),
+      fetchMdDocs(project, repoId, headers, env),
+      fetchExistingTestFiles(project, repoId, componentFiles, headers, env),
     ]);
     console.log(`(log) [PW-Context] Fetched ${mdDocs.length} .md documentation files`);
     console.log(`(log) [PW-Context] Found ${existingFiles.length} existing test file(s) on the test branch`);
@@ -302,7 +298,7 @@ async function runTestGeneration(payload, env) {
     if (!generatedTests || generatedTests.length === 0) {
       console.log("(log) [PW-Context] AI generated no tests");
       if (!dryRun) {
-        await postComment(env, project, repoId, prId, azureHeaders,
+        await postComment(env, project, repoId, prId, headers,
           `## 🎭 Playwright Test Generation\n\n⚠️ AI could not generate tests for the changed components.\n\n### Changed Components Analyzed\n${componentFiles.map(f => "- \`" + f.path + "\`").join("\n")}\n\n---\n_Generated by AI PR Review Bot — Playwright Test Gen_`,
           "PW-Context");
       }
@@ -343,7 +339,7 @@ async function runTestGeneration(payload, env) {
     } catch (pushErr) {
       console.error("(log) [PW-Context] pw-push call failed:", pushErr.message);
       // Fallback: post an error comment directly
-      await postComment(env, project, repoId, prId, azureHeaders,
+      await postComment(env, project, repoId, prId, headers,
         `## 🎭 Playwright Test Generation\n\n⚠️ Tests were generated but push worker is unreachable.\n\`${pushErr.message}\`\n\n---\n_Generated by AI PR Review Bot — Playwright Test Gen_`,
         "PW-Context");
     }
@@ -354,7 +350,7 @@ async function runTestGeneration(payload, env) {
     // Try to post an error comment (skip if dry run)
     if (!dryRun) {
       try {
-        await postComment(env, project, repoId, prId, azureHeaders,
+        await postComment(env, project, repoId, prId, headers,
           `## 🎭 Playwright Test Generation\n\n❌ An error occurred during test generation:\n\`${e.message}\`\n\n---\n_Generated by AI PR Review Bot — Playwright Test Gen_`,
           "PW-Context");
       } catch (commentErr) {
@@ -385,7 +381,7 @@ function identifyComponentFiles(fileChanges) {
 
 // ─── Step 2: Fetch .md Documentation from Test Branch ────────────────────────
 
-async function fetchMdDocs(project, repoId, azureHeaders, env) {
+async function fetchMdDocs(project, repoId, headers, env) {
   const ORG = orgUrl(env);
   console.log(`(log) [PW-Context] Fetching ${MD_DOC_PATHS.length} doc files from branch: ${PLAYWRIGHT_TEST_BRANCH}`);
 
@@ -408,7 +404,7 @@ async function fetchMdDocs(project, repoId, azureHeaders, env) {
 
       // Cache miss or KV unavailable — fetch from Azure
       const contentUrl = `${ORG}/${project}/_apis/git/repositories/${repoId}/items?path=${encodeURIComponent(docPath)}&versionDescriptor.version=${encodeURIComponent(PLAYWRIGHT_TEST_BRANCH)}&versionDescriptor.versionType=branch&includeContent=true&api-version=${AZURE_API_VERSION}`;
-      const contentRes = await fetchWithTimeout(contentUrl, { headers: azureHeaders });
+      const contentRes = await fetchWithTimeout(contentUrl, { headers });
       if (!contentRes.ok) {
         console.log(`(log) [PW-Context] Could not fetch ${docPath}: ${contentRes.status}`);
         return null;
@@ -440,7 +436,7 @@ async function fetchMdDocs(project, repoId, azureHeaders, env) {
 
 // ─── Step 2b: Fetch Existing Test Files from Test Branch ─────────────────────
 
-async function fetchExistingTestFiles(project, repoId, componentFiles, azureHeaders, env) {
+async function fetchExistingTestFiles(project, repoId, componentFiles, headers, env) {
   const ORG = orgUrl(env);
   // Paths to check: always fetch actionsFixture.ts
   const pathsToCheck = ["/tests/fixtures/actionsFixture.ts"];
@@ -455,7 +451,7 @@ async function fetchExistingTestFiles(project, repoId, componentFiles, azureHead
   const results = await Promise.allSettled(
     pathsToCheck.map(async (filePath) => {
       const contentUrl = `${ORG}/${project}/_apis/git/repositories/${repoId}/items?path=${encodeURIComponent(filePath)}&versionDescriptor.version=${encodeURIComponent(PLAYWRIGHT_TEST_BRANCH)}&versionDescriptor.versionType=branch&includeContent=true&api-version=${AZURE_API_VERSION}`;
-      const contentRes = await fetchWithTimeout(contentUrl, { headers: azureHeaders });
+      const contentRes = await fetchWithTimeout(contentUrl, { headers });
       if (!contentRes.ok) return null;
       const fullContent = await contentRes.text();
 

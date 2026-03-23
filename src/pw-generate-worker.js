@@ -14,8 +14,7 @@
  */
 
 import { checkNeuronBudget, recordNeuronUsage, NEURON_DAILY_LIMIT } from "./lib/neurons.js";
-
-const CF_AI_MODEL = "@cf/mistralai/mistral-small-3.1-24b-instruct";
+import { CF_AI_MODEL } from "./lib/constants.js";
 
 export default {
   async fetch(request, env, ctx) {

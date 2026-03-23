@@ -1,8 +1,8 @@
 import { orgUrl, AZURE_API_VERSION, azureHeaders as buildAzureHeaders } from "./lib/azure.js";
 import { fetchWithTimeout } from "./lib/fetch.js";
+import { MAX_BATCH_FILES } from "./lib/constants.js";
 
 const MAX_BACKLOG_SIZE = 3000;
-const MAX_BATCH_FILES = 40;
 const MAX_WEBHOOKS_PER_HOUR = 30;
 
 const STARTUP_TIME = Date.now();
