@@ -13,6 +13,8 @@
 		"dev:pw-push": "wrangler dev -c wrangler.pw-push.jsonc",
 		"dev:pw-generate": "wrangler dev -c wrangler.pw-generate.jsonc",
 		"dev:review": "wrangler dev -c wrangler.review.jsonc",
+		"deploy:flaky-detective": "wrangler deploy -c wrangler.flaky-detective.jsonc",
+		"dev:flaky-detective": "wrangler dev -c wrangler.flaky-detective.jsonc",
 		"start": "wrangler dev",
 		"test": "vitest",
 		"test:unit": "vitest run -c vitest.unit.config.js",

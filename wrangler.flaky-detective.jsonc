@@ -1,0 +1,23 @@
+{
+	"$schema": "node_modules/wrangler/config-schema.json",
+	"name": "flaky-detective",
+	"main": "src/flaky-detective-worker.js",
+	"compatibility_date": "2026-03-01",
+	"observability": {
+		"enabled": true
+	},
+	"compatibility_flags": [
+		"nodejs_compat"
+	],
+	"kv_namespaces": [
+		{ "binding": "BOT_KV", "id": "2360521973a242ffb6a2173389758694" }
+	],
+	"vars": {
+		"AZURE_ORG": "https://dev.azure.com/bindtuning",
+		"AZURE_PROJECT": "BindTuning"
+	}
+	// No AI binding needed — this worker only does Azure DevOps Test API reads + KV
+	// No service bindings — fully independent worker
+	// Secrets (set via wrangler secret put):
+	//   AZURE_TOKEN   – PAT for Azure DevOps API access
+}
