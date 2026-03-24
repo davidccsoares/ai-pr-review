@@ -37,11 +37,25 @@ export default {
       return new Response("Invalid JSON", { status: 400 });
     }
 
-    console.log("(log) [Gateway] Webhook received");
+    const eventType = payload?.eventType || "unknown";
+    console.log(`(log) [Gateway] Webhook received (eventType: ${eventType})`);
 
     if (!payload?.resource?.pullRequestId) {
       console.log("(log) [Gateway] No pull request ID found");
       return new Response("No PR", { status: 200 });
+    }
+
+    // ── Filter PR update events ───────────────────────────────────────────
+    // Azure DevOps fires git.pullrequest.updated for ANY change (reviewer
+    // added, vote cast, title edited, new push, …).  We only want to
+    // re-review when new code was pushed, which is the only case where
+    // lastMergeSourceCommit is present with a new commitId.
+    // The dedup key (prId + sourceCommit) already blocks duplicate reviews
+    // for the same commit, so non-push updates that still carry the old
+    // merge commit are safely deduplicated.
+    if (!payload.resource?.lastMergeSourceCommit?.commitId) {
+      console.log("(log) [Gateway] No merge source commit — skipping (likely a non-push PR update)");
+      return new Response("No source commit", { status: 200 });
     }
 
     // ── Rate Limiting ────────────────────────────────────────────────────

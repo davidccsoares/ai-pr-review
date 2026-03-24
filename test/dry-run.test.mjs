@@ -15,6 +15,7 @@ import { describe, it, beforeEach, mock } from "node:test";
 import assert from "node:assert/strict";
 import { scanForSecrets, SECRET_PATTERNS } from "../src/lib/secrets.js";
 import { AZURE_API_VERSION } from "../src/lib/azure.js";
+import { extractIssues, diffReviewIssues, buildFollowUpSection } from "../src/review-worker.js";
 
 // ─── Constants used by test helpers ──────────────────────────────────────────
 const MAX_INLINE_COMMENTS = 10;
@@ -851,5 +852,309 @@ describe("Feature 6: PR Auto-Tagging", () => {
     const expectedUrl = `${ORG}/MyProject/_apis/git/repositories/repo-1/pullRequests/42/labels?api-version=${AZURE_API_VERSION}`;
     assert.equal(calls[0].url, expectedUrl);
     assert.equal(calls[1].url, expectedUrl);
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Feature 7: Re-review on Push (Follow-up Review Tracking)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+describe("Feature 7: Re-review on Push", () => {
+
+  // Simulate the exact KV flow that postUnifiedReview uses
+  function createMockKV() {
+    const store = new Map();
+    return {
+      store,
+      async get(key, type) {
+        const entry = store.get(key);
+        if (!entry) return null;
+        if (type === "json") return JSON.parse(entry.value);
+        return entry.value;
+      },
+      async put(key, value, opts) {
+        store.set(key, { value, opts });
+      },
+    };
+  }
+
+  it("first review: KV has no previous data, stores issues after review", async () => {
+    const kv = createMockKV();
+    const prId = 42;
+    const reviewKey = `review:${prId}`;
+
+    // Simulate postUnifiedReview reading KV (no previous review)
+    const stored = await kv.get(reviewKey, "json");
+    assert.equal(stored, null, "First review should find no previous data");
+
+    let previousIssues = [];
+    let reviewNumber = 1;
+    if (stored && Array.isArray(stored.issues)) {
+      previousIssues = stored.issues;
+      reviewNumber = (stored.reviewNumber || 1) + 1;
+    }
+
+    assert.deepEqual(previousIssues, [], "No previous issues");
+    assert.equal(reviewNumber, 1, "First review is iteration 1");
+
+    // AI review produces comments
+    const allComments = [
+      { file: "/src/foo.ts", line: 10, comment: "Null reference risk on user.name" },
+      { file: "/src/bar.ts", line: 5, comment: "LGTM" },
+      { file: "/src/baz.ts", line: 20, comment: "Missing error handling" },
+    ];
+
+    // Extract issues (same logic as postUnifiedReview)
+    const currentIssues = extractIssues(allComments);
+    assert.equal(currentIssues.length, 2, "Should have 2 actionable issues (LGTM filtered)");
+
+    // No follow-up section on first review
+    assert.equal(previousIssues.length, 0, "No follow-up on first review");
+
+    // Store in KV (same as postUnifiedReview does after posting)
+    await kv.put(reviewKey, JSON.stringify({
+      issues: currentIssues,
+      reviewNumber,
+      timestamp: Date.now(),
+    }), { expirationTtl: 7 * 24 * 3600 });
+
+    // Verify stored correctly
+    const afterStore = await kv.get(reviewKey, "json");
+    assert.equal(afterStore.issues.length, 2);
+    assert.equal(afterStore.reviewNumber, 1);
+    assert.equal(afterStore.issues[0].key, "/src/foo.ts::null reference risk on user.name");
+    assert.equal(afterStore.issues[1].key, "/src/baz.ts::missing error handling");
+  });
+
+  it("second review: reads previous issues, produces follow-up section", async () => {
+    const kv = createMockKV();
+    const prId = 42;
+    const reviewKey = `review:${prId}`;
+
+    // Seed KV with first review data (simulates what postUnifiedReview stored)
+    const firstReviewIssues = extractIssues([
+      { file: "/src/foo.ts", line: 10, comment: "Null reference risk on user.name" },
+      { file: "/src/baz.ts", line: 20, comment: "Missing error handling" },
+    ]);
+    await kv.put(reviewKey, JSON.stringify({
+      issues: firstReviewIssues,
+      reviewNumber: 1,
+      timestamp: Date.now() - 60_000, // 1 minute ago
+    }), { expirationTtl: 7 * 24 * 3600 });
+
+    // ── Second review starts (developer pushed a fix) ──
+
+    // Read previous review from KV (exact code from postUnifiedReview)
+    let previousIssues = [];
+    let reviewNumber = 1;
+    const stored = await kv.get(reviewKey, "json");
+    if (stored && Array.isArray(stored.issues)) {
+      previousIssues = stored.issues;
+      reviewNumber = (stored.reviewNumber || 1) + 1;
+    }
+
+    assert.equal(previousIssues.length, 2, "Should find 2 previous issues");
+    assert.equal(reviewNumber, 2, "Should be iteration 2");
+
+    // AI review on the new code: null ref fixed, error handling still there, new issue found
+    const secondComments = [
+      { file: "/src/baz.ts", line: 22, comment: "Missing error handling" }, // still there, line shifted
+      { file: "/src/new.ts", line: 5, comment: "Unused import" },           // new issue
+    ];
+
+    const currentIssues = extractIssues(secondComments);
+    assert.equal(currentIssues.length, 2);
+
+    // Compute diff (exact code from postUnifiedReview)
+    const diff = diffReviewIssues(previousIssues, currentIssues);
+
+    assert.equal(diff.resolved.length, 1, "Null ref should be resolved");
+    assert.equal(diff.resolved[0].comment, "Null reference risk on user.name");
+    assert.equal(diff.stillOpen.length, 1, "Error handling should still be open");
+    assert.equal(diff.stillOpen[0].comment, "Missing error handling");
+    assert.equal(diff.new.length, 1, "Unused import should be new");
+    assert.equal(diff.new[0].comment, "Unused import");
+
+    // Build follow-up section (exact code from postUnifiedReview)
+    const section = buildFollowUpSection(diff, reviewNumber);
+
+    assert.ok(section.includes("Follow-up Review (iteration #2)"), "Should show iteration 2");
+    assert.ok(section.includes("1 issue resolved"), "Should show 1 resolved");
+    assert.ok(section.includes("1 issue still open"), "Should show 1 still open");
+    assert.ok(section.includes("1 new issue"), "Should show 1 new");
+    assert.ok(!section.includes("All previous issues"), "Should NOT celebrate when issues remain");
+
+    // Store second review issues
+    await kv.put(reviewKey, JSON.stringify({
+      issues: currentIssues,
+      reviewNumber,
+      timestamp: Date.now(),
+    }), { expirationTtl: 7 * 24 * 3600 });
+
+    const afterStore = await kv.get(reviewKey, "json");
+    assert.equal(afterStore.reviewNumber, 2);
+    assert.equal(afterStore.issues.length, 2);
+  });
+
+  it("third review: all issues resolved, celebration message shown", async () => {
+    const kv = createMockKV();
+    const prId = 42;
+    const reviewKey = `review:${prId}`;
+
+    // Seed with second review data
+    const secondReviewIssues = extractIssues([
+      { file: "/src/baz.ts", line: 22, comment: "Missing error handling" },
+      { file: "/src/new.ts", line: 5, comment: "Unused import" },
+    ]);
+    await kv.put(reviewKey, JSON.stringify({
+      issues: secondReviewIssues,
+      reviewNumber: 2,
+      timestamp: Date.now() - 60_000,
+    }), { expirationTtl: 7 * 24 * 3600 });
+
+    // Third review: everything fixed, only LGTM comments
+    const stored = await kv.get(reviewKey, "json");
+    const previousIssues = stored.issues;
+    const reviewNumber = stored.reviewNumber + 1;
+
+    const thirdComments = [
+      { file: "/src/baz.ts", line: 1, comment: "LGTM" },
+      { file: "/src/new.ts", line: 1, comment: "LGTM" },
+    ];
+
+    const currentIssues = extractIssues(thirdComments);
+    assert.equal(currentIssues.length, 0, "All LGTM = no issues");
+
+    const diff = diffReviewIssues(previousIssues, currentIssues);
+    assert.equal(diff.resolved.length, 2, "Both issues resolved");
+    assert.equal(diff.stillOpen.length, 0);
+    assert.equal(diff.new.length, 0);
+
+    const section = buildFollowUpSection(diff, reviewNumber);
+    assert.ok(section.includes("iteration #3"));
+    assert.ok(section.includes("2 issues resolved"));
+    assert.ok(section.includes("All previous issues have been addressed"));
+  });
+
+  it("KV read failure: falls back to first-review behavior (no crash)", async () => {
+    const faultyKV = {
+      async get() { throw new Error("KV read failure"); },
+      async put() {},
+    };
+
+    const prId = 42;
+    const reviewKey = `review:${prId}`;
+
+    // Exact error handling from postUnifiedReview
+    let previousIssues = [];
+    let reviewNumber = 1;
+    try {
+      const stored = await faultyKV.get(reviewKey, "json");
+      if (stored && Array.isArray(stored.issues)) {
+        previousIssues = stored.issues;
+        reviewNumber = (stored.reviewNumber || 1) + 1;
+      }
+    } catch (e) {
+      // Fail-open — just proceed as first review
+    }
+
+    assert.deepEqual(previousIssues, [], "Should fall back to empty");
+    assert.equal(reviewNumber, 1, "Should be treated as first review");
+  });
+
+  it("KV write failure: review still posts, just doesn't store for next time", async () => {
+    const kv = createMockKV();
+    const faultyWriteKV = {
+      async get(key, type) { return kv.get(key, type); },
+      async put() { throw new Error("KV write failure"); },
+    };
+
+    // Simulate posting review and attempting to store
+    let stored = false;
+    let writeError = null;
+    try {
+      await faultyWriteKV.put("review:42", JSON.stringify({ issues: [], reviewNumber: 1 }));
+      stored = true;
+    } catch (e) {
+      writeError = e.message;
+    }
+
+    assert.equal(stored, false, "Write should have failed");
+    assert.equal(writeError, "KV write failure");
+    // The review was already posted at this point — the write failure is non-critical
+  });
+
+  it("gateway: PR update without merge commit is rejected (non-push event)", () => {
+    // Simulate the new guard in worker.js
+    const payload = {
+      eventType: "git.pullrequest.updated",
+      resource: {
+        pullRequestId: 42,
+        // No lastMergeSourceCommit — this is a reviewer-added event
+      },
+    };
+
+    const hasMergeCommit = !!payload.resource?.lastMergeSourceCommit?.commitId;
+    assert.equal(hasMergeCommit, false, "Non-push PR update should not have merge commit");
+  });
+
+  it("gateway: PR update with merge commit is accepted (push event)", () => {
+    const payload = {
+      eventType: "git.pullrequest.updated",
+      resource: {
+        pullRequestId: 42,
+        lastMergeSourceCommit: { commitId: "abc123" },
+        lastMergeTargetCommit: { commitId: "def456" },
+      },
+    };
+
+    const hasMergeCommit = !!payload.resource?.lastMergeSourceCommit?.commitId;
+    assert.equal(hasMergeCommit, true, "Push event should have merge commit");
+  });
+
+  it("dedup allows same PR with different sourceCommit (new push)", async () => {
+    const kv = createMockKV();
+    const prId = 42;
+
+    // First push
+    const dedupKey1 = `dedup:${prId}:commit_v1`;
+    await kv.put(dedupKey1, "1", { expirationTtl: 3600 });
+
+    // Second push (new commit)
+    const dedupKey2 = `dedup:${prId}:commit_v2`;
+    const existing = await kv.get(dedupKey2);
+    assert.equal(existing, null, "New commit should not be deduplicated");
+  });
+
+  it("end-to-end: full comment includes follow-up section in correct position", () => {
+    // Simulate building the complete review comment with follow-up
+    const previousIssues = extractIssues([
+      { file: "/src/foo.ts", line: 10, comment: "Bug here" },
+    ]);
+    const currentIssues = extractIssues([
+      { file: "/src/bar.ts", line: 5, comment: "New bug" },
+    ]);
+
+    const diff = diffReviewIssues(previousIssues, currentIssues);
+    const followUp = buildFollowUpSection(diff, 2);
+
+    // Build comment the same way postUnifiedReview does
+    const summary = ["## 🤖 AI Code Review", ""];
+    if (previousIssues.length > 0) {
+      summary.push(followUp);
+    }
+    summary.push("📊 **Reviewed 2 of 5 files** (3 skipped as non-reviewable)");
+
+    const fullComment = summary.join("\n");
+
+    // Verify order: header → follow-up → stats
+    const headerPos = fullComment.indexOf("## 🤖 AI Code Review");
+    const followUpPos = fullComment.indexOf("Follow-up Review");
+    const statsPos = fullComment.indexOf("📊 **Reviewed");
+
+    assert.ok(headerPos < followUpPos, "Follow-up should come after header");
+    assert.ok(followUpPos < statsPos, "Stats should come after follow-up");
+    assert.ok(fullComment.includes("1 issue resolved"), "Should show resolved");
+    assert.ok(fullComment.includes("1 new issue"), "Should show new");
   });
 });

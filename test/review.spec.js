@@ -6,6 +6,9 @@ import {
   scanForSecrets,
   truncateDiffAtHunkBoundary,
   SECRET_PATTERNS,
+  extractIssues,
+  diffReviewIssues,
+  buildFollowUpSection,
 } from '../src/review-worker.js';
 
 // ─── computeDiff ────────────────────────────────────────────────────────────
@@ -217,5 +220,331 @@ describe('truncateDiffAtHunkBoundary', () => {
     const diff = 'a'.repeat(100);
     const result = truncateDiffAtHunkBoundary(diff, 50);
     expect(result.length).toBeLessThanOrEqual(100);
+  });
+});
+
+// ─── extractIssues ──────────────────────────────────────────────────────────
+
+describe('extractIssues', () => {
+  it('returns empty array for null/undefined input', () => {
+    expect(extractIssues(null)).toEqual([]);
+    expect(extractIssues(undefined)).toEqual([]);
+  });
+
+  it('returns empty array for empty comments', () => {
+    expect(extractIssues([])).toEqual([]);
+  });
+
+  it('filters out LGTM comments', () => {
+    const comments = [
+      { file: '/src/foo.ts', line: 1, comment: 'LGTM' },
+      { file: '/src/bar.ts', line: 5, comment: 'Looks good to me (LGTM)' },
+    ];
+    expect(extractIssues(comments)).toEqual([]);
+  });
+
+  it('filters out AI review skipped comments', () => {
+    const comments = [
+      { file: '/src/foo.ts', line: 1, comment: '⚠️ AI review skipped — daily neuron budget exhausted. Manual review recommended.' },
+    ];
+    expect(extractIssues(comments)).toEqual([]);
+  });
+
+  it('extracts real issues with normalized keys', () => {
+    const comments = [
+      { file: '/src/foo.ts', line: 10, comment: 'Possible null reference on user.name' },
+      { file: '/src/bar.ts', line: 20, comment: 'Missing error handling' },
+    ];
+    const issues = extractIssues(comments);
+    expect(issues).toHaveLength(2);
+    expect(issues[0].key).toBe('/src/foo.ts::possible null reference on user.name');
+    expect(issues[1].key).toBe('/src/bar.ts::missing error handling');
+  });
+
+  it('normalizes whitespace in keys', () => {
+    const comments = [
+      { file: '/src/foo.ts', line: 10, comment: '  Multiple   spaces   here  ' },
+    ];
+    const issues = extractIssues(comments);
+    expect(issues[0].key).toBe('/src/foo.ts::multiple spaces here');
+  });
+
+  it('skips comments without file or comment', () => {
+    const comments = [
+      { file: '', line: 1, comment: 'No file' },
+      { file: '/src/foo.ts', line: 1, comment: '' },
+      { line: 1, comment: 'No file field' },
+      { file: '/src/foo.ts', line: 1 },
+    ];
+    expect(extractIssues(comments)).toEqual([]);
+  });
+
+  it('preserves original line numbers and comments', () => {
+    const comments = [
+      { file: '/src/foo.ts', line: 42, comment: 'Bug: off-by-one error' },
+    ];
+    const issues = extractIssues(comments);
+    expect(issues[0].file).toBe('/src/foo.ts');
+    expect(issues[0].line).toBe(42);
+    expect(issues[0].comment).toBe('Bug: off-by-one error');
+  });
+});
+
+// ─── diffReviewIssues ───────────────────────────────────────────────────────
+
+describe('diffReviewIssues', () => {
+  const makeIssue = (file, comment, line = 1) => ({
+    file,
+    line,
+    comment,
+    key: `${file}::${comment.toLowerCase()}`,
+  });
+
+  it('returns all previous as resolved when current is empty', () => {
+    const prev = [makeIssue('/src/foo.ts', 'null ref')];
+    const curr = [];
+    const diff = diffReviewIssues(prev, curr);
+    expect(diff.resolved).toHaveLength(1);
+    expect(diff.stillOpen).toHaveLength(0);
+    expect(diff.new).toHaveLength(0);
+  });
+
+  it('returns all current as new when previous is empty', () => {
+    const prev = [];
+    const curr = [makeIssue('/src/foo.ts', 'missing await')];
+    const diff = diffReviewIssues(prev, curr);
+    expect(diff.resolved).toHaveLength(0);
+    expect(diff.stillOpen).toHaveLength(0);
+    expect(diff.new).toHaveLength(1);
+  });
+
+  it('identifies still-open issues by key', () => {
+    const issue = makeIssue('/src/foo.ts', 'null ref');
+    const diff = diffReviewIssues([issue], [{ ...issue, line: 15 }]); // line changed but key same
+    expect(diff.resolved).toHaveLength(0);
+    expect(diff.stillOpen).toHaveLength(1);
+    expect(diff.new).toHaveLength(0);
+  });
+
+  it('handles mixed resolved, open, and new', () => {
+    const prev = [
+      makeIssue('/src/a.ts', 'issue one'),
+      makeIssue('/src/b.ts', 'issue two'),
+    ];
+    const curr = [
+      makeIssue('/src/b.ts', 'issue two', 20), // still open (line shifted)
+      makeIssue('/src/c.ts', 'issue three'),     // new
+    ];
+    const diff = diffReviewIssues(prev, curr);
+    expect(diff.resolved).toHaveLength(1); // issue one resolved
+    expect(diff.resolved[0].comment).toBe('issue one');
+    expect(diff.stillOpen).toHaveLength(1); // issue two still open
+    expect(diff.stillOpen[0].comment).toBe('issue two');
+    expect(diff.new).toHaveLength(1); // issue three is new
+    expect(diff.new[0].comment).toBe('issue three');
+  });
+
+  it('returns empty results for both empty', () => {
+    const diff = diffReviewIssues([], []);
+    expect(diff.resolved).toHaveLength(0);
+    expect(diff.stillOpen).toHaveLength(0);
+    expect(diff.new).toHaveLength(0);
+  });
+});
+
+// ─── buildFollowUpSection ───────────────────────────────────────────────────
+
+describe('buildFollowUpSection', () => {
+  const makeIssue = (file, comment, line = 1) => ({
+    file,
+    line,
+    comment,
+    key: `${file}::${comment.toLowerCase()}`,
+  });
+
+  it('includes iteration number in header', () => {
+    const diff = { resolved: [], stillOpen: [], new: [] };
+    const result = buildFollowUpSection(diff, 3);
+    expect(result).toContain('iteration #3');
+  });
+
+  it('shows resolved issues with strikethrough', () => {
+    const diff = {
+      resolved: [makeIssue('/src/foo.ts', 'null ref', 10)],
+      stillOpen: [],
+      new: [],
+    };
+    const result = buildFollowUpSection(diff, 2);
+    expect(result).toContain('1 issue resolved');
+    expect(result).toContain('~`foo.ts`');
+    expect(result).toContain('All previous issues have been addressed');
+  });
+
+  it('shows still-open issues', () => {
+    const diff = {
+      resolved: [],
+      stillOpen: [makeIssue('/src/bar.ts', 'missing await', 5)],
+      new: [],
+    };
+    const result = buildFollowUpSection(diff, 2);
+    expect(result).toContain('1 issue still open');
+    expect(result).toContain('`bar.ts`');
+    expect(result).toContain('missing await');
+  });
+
+  it('shows new issues', () => {
+    const diff = {
+      resolved: [],
+      stillOpen: [],
+      new: [makeIssue('/src/c.ts', 'security risk', 20)],
+    };
+    const result = buildFollowUpSection(diff, 2);
+    expect(result).toContain('1 new issue');
+    expect(result).toContain('`c.ts`');
+  });
+
+  it('pluralizes correctly for multiple items', () => {
+    const diff = {
+      resolved: [makeIssue('/a', 'x'), makeIssue('/b', 'y')],
+      stillOpen: [makeIssue('/c', 'z'), makeIssue('/d', 'w'), makeIssue('/e', 'v')],
+      new: [],
+    };
+    const result = buildFollowUpSection(diff, 4);
+    expect(result).toContain('2 issues resolved');
+    expect(result).toContain('3 issues still open');
+  });
+
+  it('does not show celebration when issues remain', () => {
+    const diff = {
+      resolved: [makeIssue('/a', 'x')],
+      stillOpen: [makeIssue('/b', 'y')],
+      new: [],
+    };
+    const result = buildFollowUpSection(diff, 2);
+    expect(result).not.toContain('All previous issues have been addressed');
+  });
+
+  it('does not show celebration when new issues exist', () => {
+    const diff = {
+      resolved: [makeIssue('/a', 'x')],
+      stillOpen: [],
+      new: [makeIssue('/b', 'y')],
+    };
+    const result = buildFollowUpSection(diff, 2);
+    expect(result).not.toContain('All previous issues have been addressed');
+  });
+
+  it('ends with separator', () => {
+    const diff = { resolved: [], stillOpen: [], new: [] };
+    const result = buildFollowUpSection(diff, 2);
+    expect(result).toContain('---');
+  });
+});
+
+// ─── Re-review KV round-trip simulation ─────────────────────────────────────
+
+describe('re-review round-trip', () => {
+  const makeComment = (file, line, comment) => ({ file, line, comment });
+
+  it('simulates full first-review → push → second-review flow', () => {
+    // ── First review: AI finds 3 issues ──
+    const firstReviewComments = [
+      makeComment('/src/foo.ts', 10, 'Possible null reference on user.name'),
+      makeComment('/src/foo.ts', 25, 'Missing error handling for async call'),
+      makeComment('/src/bar.ts', 5, 'LGTM'),  // should be filtered
+      makeComment('/src/baz.ts', 8, 'Hardcoded timeout should be a constant'),
+    ];
+
+    const firstIssues = extractIssues(firstReviewComments);
+    expect(firstIssues).toHaveLength(3); // LGTM filtered out
+
+    // Simulate KV storage (JSON round-trip)
+    const stored = JSON.parse(JSON.stringify({
+      issues: firstIssues,
+      reviewNumber: 1,
+      timestamp: Date.now(),
+    }));
+
+    // ── Developer pushes a fix for the null reference and error handling ──
+    // ── Second review: AI finds 1 old issue resolved, 1 still there, 1 new ──
+    const secondReviewComments = [
+      // null reference fixed → not in this list
+      // error handling still there but line shifted
+      makeComment('/src/foo.ts', 30, 'Missing error handling for async call'),
+      // hardcoded timeout still there
+      makeComment('/src/baz.ts', 8, 'Hardcoded timeout should be a constant'),
+      // new issue found
+      makeComment('/src/new-file.ts', 3, 'Unused import'),
+    ];
+
+    const secondIssues = extractIssues(secondReviewComments);
+    expect(secondIssues).toHaveLength(3);
+
+    // Load from "KV" (simulated)
+    const previousIssues = stored.issues;
+    const reviewNumber = stored.reviewNumber + 1;
+
+    const diff = diffReviewIssues(previousIssues, secondIssues);
+
+    // The null reference was fixed → resolved
+    expect(diff.resolved).toHaveLength(1);
+    expect(diff.resolved[0].comment).toBe('Possible null reference on user.name');
+
+    // Error handling + hardcoded timeout still open (matched by comment text, not line)
+    expect(diff.stillOpen).toHaveLength(2);
+    const stillOpenComments = diff.stillOpen.map(i => i.comment);
+    expect(stillOpenComments).toContain('Missing error handling for async call');
+    expect(stillOpenComments).toContain('Hardcoded timeout should be a constant');
+
+    // Unused import is new
+    expect(diff.new).toHaveLength(1);
+    expect(diff.new[0].comment).toBe('Unused import');
+
+    // Build the follow-up section
+    const section = buildFollowUpSection(diff, reviewNumber);
+    expect(section).toContain('iteration #2');
+    expect(section).toContain('1 issue resolved');
+    expect(section).toContain('2 issues still open');
+    expect(section).toContain('1 new issue');
+    expect(section).not.toContain('All previous issues have been addressed');
+  });
+
+  it('shows celebration when all issues are resolved', () => {
+    const firstComments = [
+      makeComment('/src/foo.ts', 10, 'Bug found'),
+    ];
+    const firstIssues = extractIssues(firstComments);
+
+    // Developer fixes everything, second review is clean
+    const secondComments = [
+      makeComment('/src/foo.ts', 1, 'LGTM'),
+    ];
+    const secondIssues = extractIssues(secondComments);
+    expect(secondIssues).toHaveLength(0);
+
+    const diff = diffReviewIssues(firstIssues, secondIssues);
+    expect(diff.resolved).toHaveLength(1);
+    expect(diff.stillOpen).toHaveLength(0);
+    expect(diff.new).toHaveLength(0);
+
+    const section = buildFollowUpSection(diff, 2);
+    expect(section).toContain('All previous issues have been addressed');
+  });
+
+  it('handles AI rephrasing same issue as resolved+new (worst case)', () => {
+    // AI says "null ref" in review 1, "could be null" in review 2 — different wording
+    const firstIssues = extractIssues([
+      makeComment('/src/foo.ts', 10, 'Possible null reference on user.name'),
+    ]);
+    const secondIssues = extractIssues([
+      makeComment('/src/foo.ts', 10, 'user.name could be null here'),
+    ]);
+
+    const diff = diffReviewIssues(firstIssues, secondIssues);
+    // Different wording = different key → old shows as resolved, new shows as new
+    expect(diff.resolved).toHaveLength(1);
+    expect(diff.stillOpen).toHaveLength(0);
+    expect(diff.new).toHaveLength(1);
+    // This is the known limitation — conservative, not incorrect
   });
 });

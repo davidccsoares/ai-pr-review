@@ -31,7 +31,8 @@
       "Bash(npm test:*)",
       "Bash(npm install:*)",
       "Bash(python3:*)",
-      "Bash(npm run:*)"
+      "Bash(npm run:*)",
+      "Bash(ls -la \"C:\\\\Users\\\\david\\\\Desktop\\\\BindTuning.AdminApp\\\\BindTuning.AI.DevKit\" 2>/dev/null && find \"C:\\\\Users\\\\david\\\\Desktop\\\\BindTuning.AdminApp\\\\BindTuning.AI.DevKit\" -type f -not -path \"*/.git/*\" 2>/dev/null | head -80)"
     ]
   }
 }

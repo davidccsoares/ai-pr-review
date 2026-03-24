@@ -15,6 +15,9 @@ export { scanForSecrets, SECRET_PATTERNS } from "./lib/secrets.js";
 const MAX_FILE_DIFF = 12000;
 const MAX_BATCHES = 25;
 
+// TTL for stored review issues — 7 days (covers long-lived PRs)
+const REVIEW_ISSUES_TTL = 7 * 24 * 3600;
+
 // ─── Review Worker — "The Reviewer" ─────────────────────────────────────────
 // Receives a batch of file paths + PR metadata from the Gateway worker.
 // Fetches diffs, calls AI, self-calls for more batches, posts final review.
@@ -72,6 +75,103 @@ export function riskLevel(score) {
   if (score < 15) return "LOW";
   if (score < 35) return "MEDIUM";
   return "HIGH";
+}
+
+// ─── Re-review Tracking ─────────────────────────────────────────────────────
+
+/**
+ * Extract actionable issues from AI review comments.
+ * Filters out LGTM/no-issue comments and returns a normalized set.
+ * Each issue is keyed by "file::comment-text" (line numbers change between
+ * pushes, so we match on the issue description instead).
+ *
+ * @param {Array<{file: string, line: number, comment: string}>} comments
+ * @returns {Array<{file: string, line: number, comment: string, key: string}>}
+ */
+export function extractIssues(comments) {
+  if (!Array.isArray(comments)) return [];
+  return comments
+    .filter(c => {
+      if (!c.file || !c.comment) return false;
+      const lower = c.comment.toLowerCase().trim();
+      if (lower.includes("lgtm")) return false;
+      if (lower.startsWith("⚠️ ai review skipped")) return false;
+      return true;
+    })
+    .map(c => ({
+      file: c.file,
+      line: c.line,
+      comment: c.comment,
+      key: `${c.file}::${c.comment.trim().toLowerCase().replace(/\s+/g, " ")}`,
+    }));
+}
+
+/**
+ * Compare current review issues against previous review issues.
+ * Matching is done by normalized key (file + comment text).
+ * Line numbers are ignored because they shift between pushes.
+ *
+ * @param {Array<{key: string, file: string, line: number, comment: string}>} previousIssues
+ * @param {Array<{key: string, file: string, line: number, comment: string}>} currentIssues
+ * @returns {{ resolved: Array, stillOpen: Array, new: Array }}
+ */
+export function diffReviewIssues(previousIssues, currentIssues) {
+  const prevKeys = new Set(previousIssues.map(i => i.key));
+  const currKeys = new Set(currentIssues.map(i => i.key));
+
+  const resolved = previousIssues.filter(i => !currKeys.has(i.key));
+  const stillOpen = currentIssues.filter(i => prevKeys.has(i.key));
+  const brandNew = currentIssues.filter(i => !prevKeys.has(i.key));
+
+  return { resolved, stillOpen, new: brandNew };
+}
+
+/**
+ * Build a markdown follow-up section comparing this review to the previous one.
+ *
+ * @param {{ resolved: Array, stillOpen: Array, new: Array }} diff
+ * @param {number} reviewNumber - Which review iteration this is (2, 3, …)
+ * @returns {string} Markdown block to prepend to the review comment
+ */
+export function buildFollowUpSection(diff, reviewNumber) {
+  const lines = [
+    `### 🔄 Follow-up Review (iteration #${reviewNumber})`,
+    ``,
+  ];
+
+  if (diff.resolved.length > 0) {
+    lines.push(`**✅ ${diff.resolved.length} issue${diff.resolved.length !== 1 ? "s" : ""} resolved** since last review:`);
+    for (const issue of diff.resolved) {
+      const fileName = issue.file.split("/").pop();
+      lines.push(`- ~\`${fileName}\` line ${issue.line}: ${issue.comment}~`);
+    }
+    lines.push(``);
+  }
+
+  if (diff.stillOpen.length > 0) {
+    lines.push(`**⚠️ ${diff.stillOpen.length} issue${diff.stillOpen.length !== 1 ? "s" : ""} still open:**`);
+    for (const issue of diff.stillOpen) {
+      const fileName = issue.file.split("/").pop();
+      lines.push(`- \`${fileName}\` line ${issue.line}: ${issue.comment}`);
+    }
+    lines.push(``);
+  }
+
+  if (diff.new.length > 0) {
+    lines.push(`**🆕 ${diff.new.length} new issue${diff.new.length !== 1 ? "s" : ""} found:**`);
+    for (const issue of diff.new) {
+      const fileName = issue.file.split("/").pop();
+      lines.push(`- \`${fileName}\` line ${issue.line}: ${issue.comment}`);
+    }
+    lines.push(``);
+  }
+
+  if (diff.resolved.length > 0 && diff.stillOpen.length === 0 && diff.new.length === 0) {
+    lines.push(`🎉 **All previous issues have been addressed!**`, ``);
+  }
+
+  lines.push(`---`, ``);
+  return lines.join("\n");
 }
 
 // ─── Batch Helper: Fetch + Diff a batch of files ────────────────────────────
@@ -307,6 +407,23 @@ async function postUnifiedReview({
   const ORG = orgUrl(env);
   console.log(`(log) [Review] Posting unified review for PR ${prId} (${allFileChanges.length} files, ${allComments.length} comments, ${batchCount} batches)`);
 
+  // ── Re-review tracking: load previous review issues ────────────────────
+  let previousIssues = [];
+  let reviewNumber = 1;
+  const reviewKey = `review:${prId}`;
+  try {
+    if (env?.BOT_KV) {
+      const stored = await env.BOT_KV.get(reviewKey, "json");
+      if (stored && Array.isArray(stored.issues)) {
+        previousIssues = stored.issues;
+        reviewNumber = (stored.reviewNumber || 1) + 1;
+        console.log(`(log) [Review] Found previous review for PR ${prId}: ${previousIssues.length} issues (iteration #${reviewNumber})`);
+      }
+    }
+  } catch (e) {
+    console.log("(log) [Review] KV read for previous review failed (proceeding as first review):", e.message);
+  }
+
   // Calculate risk
   const totalChangedLines = allFileChanges.reduce((sum, fc) => sum + (fc.changedLines?.length || 0), 0);
   const riskScore = calculateRisk(allFileChanges, totalChangedLines);
@@ -354,6 +471,13 @@ ${backlogContext || ""}`;
 
   // Build summary
   const summary = [`## 🤖 AI Code Review`, ``];
+
+  // ── Re-review follow-up section ────────────────────────────────────────
+  const currentIssues = extractIssues(allComments);
+  if (previousIssues.length > 0) {
+    const diff = diffReviewIssues(previousIssues, currentIssues);
+    summary.push(buildFollowUpSection(diff, reviewNumber));
+  }
 
   // Batch info
   summary.push(
@@ -472,6 +596,20 @@ ${backlogContext || ""}`;
 
   if (summaryRes.ok) {
     console.log("(log) [Review] ✓ Unified review posted");
+
+    // ── Store current issues for future re-review comparison ─────────────
+    try {
+      if (env?.BOT_KV) {
+        await env.BOT_KV.put(reviewKey, JSON.stringify({
+          issues: currentIssues,
+          reviewNumber,
+          timestamp: Date.now(),
+        }), { expirationTtl: REVIEW_ISSUES_TTL });
+        console.log(`(log) [Review] Stored ${currentIssues.length} issues for PR ${prId} (iteration #${reviewNumber})`);
+      }
+    } catch (e) {
+      console.log("(log) [Review] KV write for review issues failed (non-critical):", e.message);
+    }
   } else {
     console.error("(log) [Review] ✗ Post failed:", summaryRes.status, await summaryRes.text());
   }
